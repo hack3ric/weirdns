@@ -56,3 +56,6 @@ dkms.conf
 
 # Build output
 /out/
+
+# Compilation database
+/compile_commands.json

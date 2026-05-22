@@ -6,13 +6,14 @@ LDFLAGS ?=
 LDLIBS  ?= -lldns
 
 SRCDIR  = src
+TOMLDIR = third_party/tomlc99
 OUTDIR  = out
 TARGET  = $(OUTDIR)/weirdns
 
-CFLAGS  += -Wall -Wextra -Wpedantic
+CFLAGS  += -Wall -Wextra -Wpedantic -I$(TOMLDIR)
 LDFLAGS += -static-libgcc
 
-OBJS    = $(SRCDIR)/main.o
+OBJS    = $(SRCDIR)/main.o $(SRCDIR)/toml.o
 
 $(TARGET): $(OBJS) | $(OUTDIR)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
@@ -20,7 +21,10 @@ $(TARGET): $(OBJS) | $(OUTDIR)
 $(OUTDIR):
 	mkdir -p $@
 
-$(SRCDIR)/main.o: $(SRCDIR)/main.c
+$(SRCDIR)/main.o: $(SRCDIR)/main.c $(TOMLDIR)/toml.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(SRCDIR)/toml.o: $(TOMLDIR)/toml.c $(TOMLDIR)/toml.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 all: $(TARGET)
@@ -34,7 +38,7 @@ release: clean all
 
 clean:
 	rm -rf $(OUTDIR)
-	rm $(OBJS)
+	rm -f $(OBJS)
 
 install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)

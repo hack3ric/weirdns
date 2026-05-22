@@ -7,9 +7,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "toml.h"
+
 #define MAX_PKT 4096
-#define MAX_UPSTREAMS 4
-#define MAX_DOMAINS 16
+#define MAX_UPSTREAMS 16
+#define MAX_DOMAINS 32
+#define MAX_ADDRS 8
 
 typedef struct {
   const char *domains[MAX_DOMAINS];
@@ -20,14 +23,21 @@ typedef struct {
   uint8_t dns64_prefix[16];
 } upstream_t;
 
-static upstream_t upstreams[4];
+static upstream_t upstreams[MAX_UPSTREAMS];
 static int n_upstreams = 0;
 static ldns_resolver *default_upstream = NULL;
+static char listen_host[64] = "127.0.0.1";
+static uint16_t listen_port = 5355;
 
-static ldns_resolver *make_resolver(const char *addr) {
+static ldns_resolver *make_resolver(const char *addrs[], int naddrs) {
   ldns_resolver *r = ldns_resolver_new();
-  ldns_rdf *ns = ldns_rdf_new_frm_str(LDNS_RDF_TYPE_A, addr);
-  ldns_resolver_push_nameserver(r, ns);
+  if (!r)
+    return NULL;
+  for (int i = 0; i < naddrs; i++) {
+    ldns_rdf *ns = ldns_rdf_new_frm_str(LDNS_RDF_TYPE_A, addrs[i]);
+    if (ns)
+      ldns_resolver_push_nameserver(r, ns);
+  }
   ldns_resolver_set_port(r, 53);
   ldns_resolver_set_usevc(r, 1);
   ldns_resolver_set_retry(r, 1);
@@ -37,7 +47,6 @@ static ldns_resolver *make_resolver(const char *addr) {
 }
 
 static int parse_prefix(const char *str, uint8_t prefix[16]) {
-  /* parse "64:ff9b::" or "64:ff9b::/96" into 16-byte IPv6 prefix */
   char buf[64];
   strncpy(buf, str, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
@@ -57,15 +66,16 @@ static int parse_prefix(const char *str, uint8_t prefix[16]) {
 }
 
 static void add_upstream(const char *domains[], int ndomains,
-                         const char *upstream_addr, int strip_a, int dns64,
+                         const char *upstream_addrs[], int naddrs,
+                         int strip_a, int dns64,
                          const char *dns64_prefix) {
-  if (n_upstreams >= 4)
+  if (n_upstreams >= MAX_UPSTREAMS)
     return;
   upstream_t *u = &upstreams[n_upstreams++];
   for (int i = 0; i < ndomains && i < MAX_DOMAINS; i++)
     u->domains[i] = domains[i];
   u->ndomains = ndomains;
-  u->resolver = make_resolver(upstream_addr);
+  u->resolver = make_resolver(upstream_addrs, naddrs);
   u->strip_a = strip_a;
   u->dns64 = dns64;
   if (dns64 && dns64_prefix)
@@ -91,7 +101,6 @@ static upstream_t *select_upstream(const char *qname) {
 }
 
 static ldns_rr *synthesize_aaaa(ldns_rr *a_rr, const uint8_t prefix[16]) {
-  /* embed IPv4 in last 32 bits of /96 prefix */
   ldns_rdf *a_rdf = ldns_rr_rdf(a_rr, 0);
   if (!a_rdf || ldns_rdf_size(a_rdf) != 4)
     return NULL;
@@ -115,7 +124,6 @@ static ldns_rr *synthesize_aaaa(ldns_rr *a_rr, const uint8_t prefix[16]) {
 }
 
 static ldns_pkt *dns64_resolve_aaaa(upstream_t *u, ldns_pkt *query) {
-  /* query upstream for A records, synthesize AAAA from them */
   ldns_pkt *a_query = ldns_pkt_clone(query);
   ldns_rr_list *qsection = ldns_pkt_question(a_query);
   ldns_rr *qrr = ldns_rr_list_rr(qsection, 0);
@@ -132,7 +140,6 @@ static ldns_pkt *dns64_resolve_aaaa(upstream_t *u, ldns_pkt *query) {
   ldns_pkt_set_opcode(resp, LDNS_PACKET_QUERY);
   ldns_pkt_set_rcode(resp, LDNS_RCODE_NOERROR);
 
-  /* copy question section */
   ldns_rr_list *orig_q = ldns_pkt_question(query);
   for (size_t i = 0; i < ldns_rr_list_rr_count(orig_q); i++)
     ldns_pkt_push_rr(resp, LDNS_SECTION_QUESTION,
@@ -220,23 +227,173 @@ static int serve(int sock, ldns_pkt *query, struct sockaddr_in *client,
   return 0;
 }
 
-int main(void) {
-  const char *dns64_std_domains[] = {
-      "example.com.",
-      "example.org.",
-      "ipv4only.arpa.",
-  };
-  const char *dns64_cust_domains[] = {
-      "example.net.",
-      "httpbin.org.",
-  };
+static void config_load(const char *path) {
+  FILE *fp = fopen(path, "r");
+  if (!fp) {
+    fprintf(stderr, "Cannot open %s: ", path);
+    perror("");
+    exit(1);
+  }
+  char errbuf[200];
+  toml_table_t *conf = toml_parse_file(fp, errbuf, sizeof(errbuf));
+  fclose(fp);
+  if (!conf) {
+    fprintf(stderr, "Parse error in %s: %s\n", path, errbuf);
+    exit(1);
+  }
+
+  {
+    toml_datum_t d = toml_string_in(conf, "listen");
+    if (d.ok) {
+      char *colon = strrchr(d.u.s, ':');
+      if (colon) {
+        *colon = '\0';
+        strncpy(listen_host, d.u.s, sizeof(listen_host) - 1);
+        listen_host[sizeof(listen_host) - 1] = '\0';
+        listen_port = (uint16_t)atoi(colon + 1);
+        if (listen_port == 0)
+          listen_port = 53;
+      }
+      free(d.u.s);
+    }
+  }
+
+  {
+    toml_table_t *def = toml_table_in(conf, "default");
+    if (def) {
+      toml_array_t *arr = toml_array_in(def, "upstream");
+      if (arr) {
+        int n = toml_array_nelem(arr);
+        const char *addrs[MAX_ADDRS];
+        int naddr = 0;
+        for (int i = 0; i < n && naddr < MAX_ADDRS; i++) {
+          toml_datum_t d = toml_string_at(arr, i);
+          if (d.ok) {
+            addrs[naddr++] = strdup(d.u.s);
+            free(d.u.s);
+          }
+        }
+        if (naddr > 0) {
+          default_upstream = make_resolver(addrs, naddr);
+          for (int i = 0; i < naddr; i++)
+            free((void *)addrs[i]);
+        }
+      }
+    }
+  }
+
+  {
+    toml_array_t *ups = toml_array_in(conf, "upstream");
+    if (ups) {
+      int n = toml_array_nelem(ups);
+      for (int i = 0; i < n; i++) {
+        toml_table_t *t = toml_table_at(ups, i);
+        if (!t)
+          continue;
+
+        const char *dom_arr[MAX_DOMAINS];
+        int ndom = 0;
+        {
+          toml_array_t *darr = toml_array_in(t, "domains");
+          if (darr) {
+            int nd = toml_array_nelem(darr);
+            for (int j = 0; j < nd && ndom < MAX_DOMAINS; j++) {
+              toml_datum_t d = toml_string_at(darr, j);
+              if (d.ok) {
+                dom_arr[ndom++] = strdup(d.u.s);
+                free(d.u.s);
+              }
+            }
+          }
+        }
+        if (ndom == 0)
+          continue;
+
+        const char *addr_arr[MAX_ADDRS];
+        int naddr = 0;
+        {
+          toml_array_t *aarr = toml_array_in(t, "address");
+          if (aarr) {
+            int na = toml_array_nelem(aarr);
+            for (int j = 0; j < na && naddr < MAX_ADDRS; j++) {
+              toml_datum_t d = toml_string_at(aarr, j);
+              if (d.ok) {
+                addr_arr[naddr++] = strdup(d.u.s);
+                free(d.u.s);
+              }
+            }
+          }
+        }
+        if (naddr == 0) {
+          for (int j = 0; j < ndom; j++)
+            free((void *)dom_arr[j]);
+          continue;
+        }
+
+        int strip_a = false;
+        {
+          toml_datum_t d = toml_bool_in(t, "strip_a");
+          if (d.ok)
+            strip_a = d.u.b;
+        }
+
+        int dns64_enabled = 0;
+        const char *prefix_str = NULL;
+        {
+          toml_datum_t d = toml_string_in(t, "dns64_prefix");
+          if (d.ok && d.u.s[0] != '\0') {
+            uint8_t tmp[16];
+            if (parse_prefix(d.u.s, tmp) == 0) {
+              dns64_enabled = 1;
+              prefix_str = d.u.s;
+            }
+          }
+          add_upstream(dom_arr, ndom, addr_arr, naddr, strip_a,
+                       dns64_enabled, prefix_str);
+          if (d.ok)
+            free(d.u.s);
+        }
+
+        for (int j = 0; j < naddr; j++)
+          free((void *)addr_arr[j]);
+      }
+    }
+  }
+
+  if (!default_upstream) {
+    fprintf(stderr, "Config error: no [default] section with upstream defined\n");
+    exit(1);
+  }
+
+  toml_free(conf);
+}
+
+static void usage(const char *prog) {
+  fprintf(stderr, "Usage: %s [-c config.toml]\n", prog);
+  fprintf(stderr, "  -c PATH   path to config file (default: weirdns.toml)\n");
+  fprintf(stderr, "  -h        show this help\n");
+}
+
+int main(int argc, char *argv[]) {
+  const char *config_path = "weirdns.toml";
+  int opt;
+
+  while ((opt = getopt(argc, argv, "c:h")) != -1) {
+    switch (opt) {
+    case 'c':
+      config_path = optarg;
+      break;
+    case 'h':
+      usage(argv[0]);
+      return 0;
+    default:
+      usage(argv[0]);
+      return 1;
+    }
+  }
 
   ldns_init_random(NULL, 0);
-
-  add_upstream(dns64_std_domains, 3, "1.1.1.1", 1, 1, "64:ff9b::");
-  add_upstream(dns64_cust_domains, 2, "8.8.8.8", 1, 1, "2001:db8:64::");
-
-  default_upstream = make_resolver("1.1.1.1");
+  config_load(config_path);
 
   int sock = socket(AF_INET, SOCK_DGRAM, 0);
   if (sock < 0) {
@@ -246,15 +403,15 @@ int main(void) {
 
   struct sockaddr_in addr = {0};
   addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = htons(5355);
+  addr.sin_addr.s_addr = inet_addr(listen_host);
+  addr.sin_port = htons(listen_port);
 
   if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
     perror("bind");
     return 1;
   }
 
-  printf("dns64-gateway listening on 127.0.0.1:5355\n");
+  printf("listening on %s:%u\n", listen_host, listen_port);
 
   for (;;) {
     uint8_t buf[MAX_PKT];
