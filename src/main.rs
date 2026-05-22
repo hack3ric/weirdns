@@ -9,11 +9,9 @@ use config::Config;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::AAAA;
 use hickory_proto::rr::{RData, Record, RecordType};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::time::timeout;
-
-
+use smol::future::FutureExt as _;
+use smol::io::{AsyncReadExt, AsyncWriteExt};
+use smol::net::{TcpStream, UdpSocket};
 
 const TCP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PKT: usize = 4096;
@@ -88,14 +86,21 @@ impl App {
       Ok::<_, std::io::Error>(resp)
     };
 
-    match timeout(TCP_TIMEOUT, connect).await {
-      Ok(Ok(resp)) => Some(resp),
-      Ok(Err(e)) => {
-        eprintln!("upstream error: {addr}, {qname}: {e}");
-        None
-      }
-      Err(_) => {
-        eprintln!("upstream timeout: {addr}, {qname}");
+    let result = connect
+      .or(async {
+        smol::Timer::after(TCP_TIMEOUT).await;
+        Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"))
+      })
+      .await;
+
+    match result {
+      Ok(resp) => Some(resp),
+      Err(e) => {
+        if e.kind() == std::io::ErrorKind::TimedOut {
+          eprintln!("upstream timeout: {addr}, {qname}");
+        } else {
+          eprintln!("upstream error: {addr}, {qname}: {e}");
+        }
         None
       }
     }
@@ -245,57 +250,61 @@ fn parse_args() -> String {
   config_path
 }
 
-#[tokio::main]
-async fn main() {
-  let config_path = parse_args();
-  let config = Config::load(&config_path);
-  let listen_addr = format!("{}:{}", config.listen_host, config.listen_port);
+fn main() {
+  let ex = smol::LocalExecutor::new();
 
-  let app = Arc::new(App::new(&config));
+  smol::block_on(ex.run(async {
+    let config_path = parse_args();
+    let config = Config::load(&config_path);
+    let listen_addr = format!("{}:{}", config.listen_host, config.listen_port);
 
-  let socket = Arc::new(UdpSocket::bind(&listen_addr).await.unwrap_or_else(|e| {
-    eprintln!("bind {}: {}", listen_addr, e);
-    std::process::exit(1);
+    let app = Arc::new(App::new(&config));
+
+    let socket = Arc::new(UdpSocket::bind(&listen_addr).await.unwrap_or_else(|e| {
+      eprintln!("bind {}: {}", listen_addr, e);
+      std::process::exit(1);
+    }));
+
+    eprintln!("listening on {listen_addr}");
+
+    let mut buf = vec![0u8; MAX_PKT];
+    loop {
+      let (n, src) = match socket.recv_from(&mut buf).await {
+        Ok(v) => v,
+        Err(e) => {
+          eprintln!("recvfrom: {e}");
+          continue;
+        }
+      };
+
+      let query = match Message::from_vec(&buf[..n]) {
+        Ok(q) => q,
+        Err(_) => {
+          eprintln!("failed to parse query from {src}");
+          continue;
+        }
+      };
+
+      let qname = query.queries.first().map(|q| q.name().to_string()).unwrap_or_default();
+      let qtype = query.queries.first().map(|q| q.query_type()).unwrap_or(RecordType::A);
+
+      let app = app.clone();
+      let socket = socket.clone();
+
+      ex.spawn(async move {
+        let upstream = app.select_upstream(&qname);
+        let up_label = upstream.map(|u| u.domains.join(",")).unwrap_or_else(|| "default".into());
+
+        eprintln!("query: {src} {qname} {qtype:?} upstream={up_label}");
+
+        if let Some(resp) = app.handle_query(&query, upstream).await {
+          eprintln!("response: {src} {qname} len={}", resp.len());
+          let _ = socket.send_to(&resp, src).await;
+        } else {
+          eprintln!("no upstream response: {src}, {qname}");
+        }
+      })
+      .detach();
+    }
   }));
-
-  eprintln!("listening on {listen_addr}");
-
-  let mut buf = vec![0u8; MAX_PKT];
-  loop {
-    let (n, src) = match socket.recv_from(&mut buf).await {
-      Ok(v) => v,
-      Err(e) => {
-        eprintln!("recvfrom: {e}");
-        continue;
-      }
-    };
-
-    let query = match Message::from_vec(&buf[..n]) {
-      Ok(q) => q,
-      Err(_) => {
-        eprintln!("failed to parse query from {src}");
-        continue;
-      }
-    };
-
-    let qname = query.queries.first().map(|q| q.name().to_string()).unwrap_or_default();
-    let qtype = query.queries.first().map(|q| q.query_type()).unwrap_or(RecordType::A);
-
-    let app = app.clone();
-    let socket = socket.clone();
-
-    tokio::spawn(async move {
-      let upstream = app.select_upstream(&qname);
-      let up_label = upstream.map(|u| u.domains.join(",")).unwrap_or_else(|| "default".into());
-
-      eprintln!("query: {src} {qname} {qtype:?} upstream={up_label}");
-
-      if let Some(resp) = app.handle_query(&query, upstream).await {
-        eprintln!("response: {src} {qname} len={}", resp.len());
-        let _ = socket.send_to(&resp, src).await;
-      } else {
-        eprintln!("no upstream response: {src}, {qname}");
-      }
-    });
-  }
 }
