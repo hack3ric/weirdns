@@ -1,24 +1,23 @@
 mod config;
 
+use crate::config::Config;
+use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::rr::rdata::AAAA;
+use hickory_proto::rr::{Name, RData, Record, RecordType};
+use smol::future::FutureExt as _;
+use smol::io::{AsyncReadExt, AsyncWriteExt};
+use smol::net::{TcpStream, UdpSocket};
 use std::mem;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::time::Duration;
-
-use config::Config;
-use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
-use hickory_proto::rr::rdata::AAAA;
-use hickory_proto::rr::{RData, Record, RecordType};
-use smol::future::FutureExt as _;
-use smol::io::{AsyncReadExt, AsyncWriteExt};
-use smol::net::{TcpStream, UdpSocket};
 
 const TCP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PKT: usize = 4096;
 
 #[derive(Clone)]
 struct Upstream {
-  domains: Vec<String>,
+  domains: Vec<Name>,
   addresses: Vec<String>,
   strip_a: bool,
   dns64_prefix: Option<Ipv6Addr>,
@@ -35,7 +34,7 @@ impl App {
       .upstreams
       .iter()
       .map(|u| Upstream {
-        domains: u.domains.clone(),
+        domains: u.domains.iter().map(|d| Name::from_str_relaxed(d).unwrap()).collect(),
         addresses: u.addresses.clone(),
         strip_a: u.strip_a,
         dns64_prefix: u.dns64_prefix,
@@ -44,148 +43,23 @@ impl App {
     App { default_addrs: config.default_upstream.clone(), upstreams }
   }
 
-  fn domain_matches(qname: &str, domain: &str) -> bool {
-    let qlen = qname.len();
-    let dlen = domain.len();
-    if dlen > qlen {
-      return false;
-    }
-    qname[qlen - dlen..]
-      .chars()
-      .zip(domain.chars())
-      .all(|(a, b)| a.eq_ignore_ascii_case(&b))
-  }
-
-  fn select_upstream(&self, qname: &str) -> Option<&Upstream> {
+  fn select_upstream(&self, qname: &Name) -> Option<&Upstream> {
     self
       .upstreams
       .iter()
-      .find(|u| u.domains.iter().any(|d| Self::domain_matches(qname, d)))
-  }
-
-  async fn tcp_query(&self, addr: &str, query: &[u8], qname: &str) -> Option<Vec<u8>> {
-    let connect = async {
-      let mut stream = TcpStream::connect(addr).await?;
-
-      let len = query.len() as u16;
-      let mut packet = Vec::with_capacity(2 + query.len());
-      packet.extend_from_slice(&len.to_be_bytes());
-      packet.extend_from_slice(query);
-      stream.write_all(&packet).await?;
-
-      let mut len_buf = [0u8; 2];
-      stream.read_exact(&mut len_buf).await?;
-      let resp_len = u16::from_be_bytes(len_buf) as usize;
-
-      if resp_len > MAX_PKT {
-        return Err(std::io::Error::other("response too large"));
-      }
-
-      let mut resp = vec![0u8; resp_len];
-      stream.read_exact(&mut resp).await?;
-      Ok::<_, std::io::Error>(resp)
-    };
-
-    let result = connect
-      .or(async {
-        smol::Timer::after(TCP_TIMEOUT).await;
-        Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"))
-      })
-      .await;
-
-    match result {
-      Ok(resp) => Some(resp),
-      Err(e) => {
-        if e.kind() == std::io::ErrorKind::TimedOut {
-          eprintln!("upstream timeout: {addr}, {qname}");
-        } else {
-          eprintln!("upstream error: {addr}, {qname}: {e}");
-        }
-        None
-      }
-    }
-  }
-
-  async fn resolve(&self, addresses: &[String], query_bytes: &[u8], qname: &str) -> Option<Vec<u8>> {
-    for addr in addresses {
-      let a = if addr.contains(':') {
-        format!("[{}]:53", addr)
-      } else {
-        format!("{}:53", addr)
-      };
-      if let Some(resp) = self.tcp_query(&a, query_bytes, qname).await {
-        return Some(resp);
-      }
-    }
-    None
-  }
-
-  fn synthesize_aaaa(&self, prefix: &Ipv6Addr, a_record: &Record) -> Option<Record> {
-    let a_rdata = match &a_record.data {
-      RData::A(a) => a.0,
-      _ => return None,
-    };
-
-    let prefix_bytes = prefix.octets();
-    let a_bytes = a_rdata.octets();
-
-    let mut ipv6_bytes = [0u8; 16];
-    ipv6_bytes[..12].copy_from_slice(&prefix_bytes[..12]);
-    ipv6_bytes[12..].copy_from_slice(&a_bytes);
-
-    let ipv6 = Ipv6Addr::from(ipv6_bytes);
-
-    let mut rr = Record::from_rdata(a_record.name.clone(), a_record.ttl, RData::AAAA(AAAA(ipv6)));
-    rr.dns_class = a_record.dns_class;
-    Some(rr)
-  }
-
-  async fn handle_dns64(&self, query: &Message, upstream: &Upstream) -> Option<Vec<u8>> {
-    let prefix = upstream.dns64_prefix?;
-    let qname = query.queries.first().map(|q| q.name().to_string()).unwrap_or_default();
-
-    let mut a_query = Message::new(query.id, MessageType::Query, OpCode::Query);
-    a_query.metadata.recursion_desired = true;
-
-    for q in &query.queries {
-      a_query.add_query(hickory_proto::op::Query::query(q.name.clone(), RecordType::A));
-    }
-
-    let a_bytes = a_query.to_vec().ok()?;
-    let a_resp_bytes = self.resolve(&upstream.addresses, &a_bytes, &qname).await?;
-    let a_resp = Message::from_vec(&a_resp_bytes).ok()?;
-
-    let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
-    resp.metadata.recursion_available = true;
-    resp.metadata.response_code = ResponseCode::NoError;
-
-    for q in &query.queries {
-      resp.add_query(q.clone());
-    }
-
-    let mut n = 0;
-    for rr in &a_resp.answers {
-      if rr.record_type() == RecordType::A
-        && let Some(aaaa) = self.synthesize_aaaa(&prefix, rr)
-      {
-        resp.add_answer(aaaa);
-        n += 1;
-      }
-    }
-
-    eprintln!("dns64: {qname} synthesized={n}");
-    resp.to_vec().ok()
+      .find(|u| u.domains.iter().any(|d| domain_matches(qname, d)))
   }
 
   async fn handle_query(&self, query: &Message, upstream: Option<&Upstream>) -> Option<Vec<u8>> {
     let qtype = query.queries.first().map(|q| q.query_type()).unwrap_or(RecordType::A);
-    let qname = query.queries.first().map(|q| q.name().to_string()).unwrap_or_default();
+    let root = Name::root();
+    let qname = query.queries.first().map(|q| q.name()).unwrap_or(&root);
 
     if let Some(up) = upstream
       && up.dns64_prefix.is_some()
       && qtype == RecordType::AAAA
     {
-      return self.handle_dns64(query, up).await;
+      return handle_dns64(query, up).await;
     }
 
     let query_bytes = query.to_vec().ok()?;
@@ -195,7 +69,7 @@ impl App {
       None => &self.default_addrs[..],
     };
 
-    let resp_bytes = self.resolve(addresses, &query_bytes, &qname).await?;
+    let resp_bytes = resolve(addresses, &query_bytes, qname).await?;
 
     let mut resp = Message::from_vec(&resp_bytes).ok()?;
     resp.metadata.id = query.id;
@@ -216,6 +90,130 @@ impl App {
 
     resp.to_vec().ok()
   }
+}
+
+fn domain_matches(qname: &Name, domain: &Name) -> bool {
+  qname.num_labels() >= domain.num_labels()
+    && qname
+      .iter()
+      .rev()
+      .zip(domain.iter().rev())
+      .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+async fn tcp_query(addr: &str, query: &[u8], qname: &Name) -> Option<Vec<u8>> {
+  let connect = async {
+    let mut stream = TcpStream::connect(addr).await?;
+
+    let len = query.len() as u16;
+    let mut packet = Vec::with_capacity(2 + query.len());
+    packet.extend_from_slice(&len.to_be_bytes());
+    packet.extend_from_slice(query);
+    stream.write_all(&packet).await?;
+
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).await?;
+    let resp_len = u16::from_be_bytes(len_buf) as usize;
+
+    if resp_len > MAX_PKT {
+      return Err(std::io::Error::other("response too large"));
+    }
+
+    let mut resp = vec![0u8; resp_len];
+    stream.read_exact(&mut resp).await?;
+    Ok::<_, std::io::Error>(resp)
+  };
+
+  let result = connect
+    .or(async {
+      smol::Timer::after(TCP_TIMEOUT).await;
+      Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"))
+    })
+    .await;
+
+  match result {
+    Ok(resp) => Some(resp),
+    Err(e) => {
+      if e.kind() == std::io::ErrorKind::TimedOut {
+        eprintln!("upstream timeout: {addr}, {qname}");
+      } else {
+        eprintln!("upstream error: {addr}, {qname}: {e}");
+      }
+      None
+    }
+  }
+}
+
+async fn resolve(addresses: &[String], query_bytes: &[u8], qname: &Name) -> Option<Vec<u8>> {
+  for addr in addresses {
+    let a = if addr.contains(':') {
+      format!("[{}]:53", addr)
+    } else {
+      format!("{}:53", addr)
+    };
+    if let Some(resp) = tcp_query(&a, query_bytes, qname).await {
+      return Some(resp);
+    }
+  }
+  None
+}
+
+fn synthesize_aaaa(prefix: &Ipv6Addr, a_record: &Record) -> Option<Record> {
+  let a_rdata = match &a_record.data {
+    RData::A(a) => a.0,
+    _ => return None,
+  };
+
+  let prefix_bytes = prefix.octets();
+  let a_bytes = a_rdata.octets();
+
+  let mut ipv6_bytes = [0u8; 16];
+  ipv6_bytes[..12].copy_from_slice(&prefix_bytes[..12]);
+  ipv6_bytes[12..].copy_from_slice(&a_bytes);
+
+  let ipv6 = Ipv6Addr::from(ipv6_bytes);
+
+  let mut rr = Record::from_rdata(a_record.name.clone(), a_record.ttl, RData::AAAA(AAAA(ipv6)));
+  rr.dns_class = a_record.dns_class;
+  Some(rr)
+}
+
+async fn handle_dns64(query: &Message, upstream: &Upstream) -> Option<Vec<u8>> {
+  let prefix = upstream.dns64_prefix?;
+  let root = Name::root();
+  let qname = query.queries.first().map(|q| q.name()).unwrap_or(&root);
+
+  let mut a_query = Message::new(query.id, MessageType::Query, OpCode::Query);
+  a_query.metadata.recursion_desired = true;
+
+  for q in &query.queries {
+    a_query.add_query(hickory_proto::op::Query::query(q.name.clone(), RecordType::A));
+  }
+
+  let a_bytes = a_query.to_vec().ok()?;
+  let a_resp_bytes = resolve(&upstream.addresses, &a_bytes, qname).await?;
+  let a_resp = Message::from_vec(&a_resp_bytes).ok()?;
+
+  let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
+  resp.metadata.recursion_available = true;
+  resp.metadata.response_code = ResponseCode::NoError;
+
+  for q in &query.queries {
+    resp.add_query(q.clone());
+  }
+
+  let mut n = 0;
+  for rr in &a_resp.answers {
+    if rr.record_type() == RecordType::A
+      && let Some(aaaa) = synthesize_aaaa(&prefix, rr)
+    {
+      resp.add_answer(aaaa);
+      n += 1;
+    }
+  }
+
+  eprintln!("dns64: {qname} synthesized={n}");
+  resp.to_vec().ok()
 }
 
 fn usage(prog: &str) {
@@ -285,7 +283,7 @@ fn main() {
         }
       };
 
-      let qname = query.queries.first().map(|q| q.name().to_string()).unwrap_or_default();
+      let qname = query.queries.first().map(|q| q.name().clone()).unwrap_or_else(Name::root);
       let qtype = query.queries.first().map(|q| q.query_type()).unwrap_or(RecordType::A);
 
       let app = app.clone();
@@ -293,7 +291,9 @@ fn main() {
 
       ex.spawn(async move {
         let upstream = app.select_upstream(&qname);
-        let up_label = upstream.map(|u| u.domains.join(",")).unwrap_or_else(|| "default".into());
+        let up_label = upstream
+          .map(|u| u.domains.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","))
+          .unwrap_or_else(|| "default".into());
 
         eprintln!("query: {src} {qname} {qtype:?} upstream={up_label}");
 
