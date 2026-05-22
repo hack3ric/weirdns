@@ -1,24 +1,24 @@
 # weirdns TOML configuration
 
-listen = "127.0.0.1:5355"
+listen = "127.0.0.1:5353"
 upstream = ["1.1.1.1"]
 
 [[rule]]
-domains = ["example.com.", "example.org.", "ipv4only.arpa."]
+domains = ["example.com", "example.org", "ipv4only.arpa"]
 upstream = ["1.1.1.1"]
 strip_a = true
 dns64_prefix = "64:ff9b::"
 
 [[rule]]
-domains = ["example.net.", "httpbin.org."]
+domains = ["example.net", "httpbin.org"]
 upstream = ["8.8.8.8"]
 strip_a = false
 dns64_prefix = "2001:db8:64::"
 
 [[rule]]
-domains = ["github.com.", "bilibili.com."]
+domains = ["github.com", "bilibili.com"]
 upstream = ["8.8.8.8"]
 
 [[rule]]
-domains = ["cnki.net."]
+domains = ["cnki.net"]
 upstream = ["223.5.5.5", "223.6.6.6"]
