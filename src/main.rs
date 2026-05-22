@@ -1,72 +1,99 @@
-mod config;
-
-use crate::config::Config;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::AAAA;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
+use serde::Deserialize;
+use serde_with::{DeserializeAs, serde_as};
 use smol::future::FutureExt as _;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 use smol::net::{TcpStream, UdpSocket};
 use std::mem;
-use std::net::Ipv6Addr;
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::rc::Rc;
 use std::time::Duration;
 
 const TCP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PKT: usize = 4096;
+const DNS_PORT: u16 = 53;
 
-#[derive(Clone)]
-struct Upstream {
+struct Addr<const PORT: u16>;
+
+impl<'de, const PORT: u16> DeserializeAs<'de, SocketAddr> for Addr<PORT> {
+  fn deserialize_as<D>(d: D) -> Result<SocketAddr, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    let s = String::deserialize(d)?;
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+      return Ok(addr);
+    }
+    match s.parse::<IpAddr>() {
+      Ok(ip) => Ok(SocketAddr::new(ip, PORT)),
+      Err(_) => Err(serde::de::Error::custom(format!(
+        "expected IP or socket address, got: {s}"
+      ))),
+    }
+  }
+}
+
+#[serde_as]
+#[derive(Deserialize)]
+struct Config {
+  listen: SocketAddr,
+  #[serde_as(as = "Vec<Addr<DNS_PORT>>")]
+  upstream: Vec<SocketAddr>,
+  #[serde(rename = "rule")]
+  rules: Vec<Rule>,
+}
+
+#[serde_as]
+#[derive(Deserialize)]
+struct Rule {
   domains: Vec<Name>,
-  addresses: Vec<String>,
-  strip_a: bool,
+  #[serde(default)]
+  #[serde_as(as = "Vec<Addr<DNS_PORT>>")]
+  upstream: Vec<SocketAddr>,
   dns64_prefix: Option<Ipv6Addr>,
+  #[serde(default)]
+  strip_a: bool,
 }
 
 struct App {
-  upstreams: Vec<Upstream>,
-  default_addrs: Vec<String>,
+  config: Config,
 }
 
 impl App {
-  fn new(config: &Config) -> Self {
-    let upstreams = config
-      .upstreams
-      .iter()
-      .map(|u| Upstream {
-        domains: u.domains.iter().map(|d| Name::from_str_relaxed(d).unwrap()).collect(),
-        addresses: u.addresses.clone(),
-        strip_a: u.strip_a,
-        dns64_prefix: u.dns64_prefix,
-      })
-      .collect();
-    App { default_addrs: config.default_upstream.clone(), upstreams }
+  fn new(config: Config) -> Self {
+    App { config }
   }
 
-  fn select_upstream(&self, qname: &Name) -> Option<&Upstream> {
+  fn select_rule(&self, qname: &Name) -> Option<&Rule> {
     self
-      .upstreams
+      .config
+      .rules
       .iter()
       .find(|u| u.domains.iter().any(|d| domain_matches(qname, d)))
   }
 
-  async fn handle_query(&self, query: &Message, upstream: Option<&Upstream>) -> Option<Vec<u8>> {
-    let qtype = query.queries.first().map(|q| q.query_type()).unwrap_or(RecordType::A);
+  async fn handle_query(&self, query: &Message, rule: Option<&Rule>) -> Option<Vec<u8>> {
     let root = Name::root();
-    let qname = query.queries.first().map(|q| q.name()).unwrap_or(&root);
+    let (qtype, qname) = query
+      .queries
+      .first()
+      .map(|q| (q.query_type(), q.name()))
+      .unwrap_or((RecordType::A, &root));
 
-    if let Some(up) = upstream
-      && up.dns64_prefix.is_some()
+    if let Some(rule) = rule
+      && rule.dns64_prefix.is_some()
       && qtype == RecordType::AAAA
     {
-      return handle_dns64(query, up).await;
+      return handle_dns64(query, rule).await;
     }
 
     let query_bytes = query.to_vec().ok()?;
 
-    let addresses = match upstream {
-      Some(up) => &up.addresses[..],
-      None => &self.default_addrs[..],
+    let addresses = match rule {
+      Some(rule) => &rule.upstream[..],
+      None => &self.config.upstream[..],
     };
 
     let resp_bytes = resolve(addresses, &query_bytes, qname).await?;
@@ -74,8 +101,8 @@ impl App {
     let mut resp = Message::from_vec(&resp_bytes).ok()?;
     resp.metadata.id = query.id;
 
-    if let Some(up) = upstream
-      && up.strip_a
+    if let Some(rule) = rule
+      && rule.strip_a
     {
       let total = resp.answers.len();
       let answers = mem::take(&mut resp.answers);
@@ -101,7 +128,7 @@ fn domain_matches(qname: &Name, domain: &Name) -> bool {
       .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
-async fn tcp_query(addr: &str, query: &[u8], qname: &Name) -> Option<Vec<u8>> {
+async fn tcp_query(addr: &SocketAddr, query: &[u8], qname: &Name) -> Option<Vec<u8>> {
   let connect = async {
     let mut stream = TcpStream::connect(addr).await?;
 
@@ -135,30 +162,25 @@ async fn tcp_query(addr: &str, query: &[u8], qname: &Name) -> Option<Vec<u8>> {
     Ok(resp) => Some(resp),
     Err(e) => {
       if e.kind() == std::io::ErrorKind::TimedOut {
-        eprintln!("upstream timeout: {addr}, {qname}");
+        eprintln!("upstream timeout: {addr:?}, {qname}");
       } else {
-        eprintln!("upstream error: {addr}, {qname}: {e}");
+        eprintln!("upstream error: {addr:?}, {qname}: {e}");
       }
       None
     }
   }
 }
 
-async fn resolve(addresses: &[String], query_bytes: &[u8], qname: &Name) -> Option<Vec<u8>> {
+async fn resolve(addresses: &[SocketAddr], query_bytes: &[u8], qname: &Name) -> Option<Vec<u8>> {
   for addr in addresses {
-    let a = if addr.contains(':') {
-      format!("[{}]:53", addr)
-    } else {
-      format!("{}:53", addr)
-    };
-    if let Some(resp) = tcp_query(&a, query_bytes, qname).await {
+    if let Some(resp) = tcp_query(addr, query_bytes, qname).await {
       return Some(resp);
     }
   }
   None
 }
 
-fn synthesize_aaaa(prefix: &Ipv6Addr, a_record: &Record) -> Option<Record> {
+fn synthesize_aaaa(prefix: Ipv6Addr, a_record: &Record) -> Option<Record> {
   let a_rdata = match &a_record.data {
     RData::A(a) => a.0,
     _ => return None,
@@ -178,8 +200,8 @@ fn synthesize_aaaa(prefix: &Ipv6Addr, a_record: &Record) -> Option<Record> {
   Some(rr)
 }
 
-async fn handle_dns64(query: &Message, upstream: &Upstream) -> Option<Vec<u8>> {
-  let prefix = upstream.dns64_prefix?;
+async fn handle_dns64(query: &Message, rule: &Rule) -> Option<Vec<u8>> {
+  let prefix = rule.dns64_prefix?;
   let root = Name::root();
   let qname = query.queries.first().map(|q| q.name()).unwrap_or(&root);
 
@@ -191,7 +213,7 @@ async fn handle_dns64(query: &Message, upstream: &Upstream) -> Option<Vec<u8>> {
   }
 
   let a_bytes = a_query.to_vec().ok()?;
-  let a_resp_bytes = resolve(&upstream.addresses, &a_bytes, qname).await?;
+  let a_resp_bytes = resolve(&rule.upstream, &a_bytes, qname).await?;
   let a_resp = Message::from_vec(&a_resp_bytes).ok()?;
 
   let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
@@ -205,7 +227,7 @@ async fn handle_dns64(query: &Message, upstream: &Upstream) -> Option<Vec<u8>> {
   let mut n = 0;
   for rr in &a_resp.answers {
     if rr.record_type() == RecordType::A
-      && let Some(aaaa) = synthesize_aaaa(&prefix, rr)
+      && let Some(aaaa) = synthesize_aaaa(prefix, rr)
     {
       resp.add_answer(aaaa);
       n += 1;
@@ -251,21 +273,28 @@ fn parse_args() -> String {
 fn main() {
   let ex = smol::LocalExecutor::new();
 
+  let config_path = parse_args();
+  let content = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+    eprintln!("Cannot open {config_path}: {e}");
+    std::process::exit(1);
+  });
+
+  let cfg: Config = toml::from_str(&content).unwrap_or_else(|e| {
+    eprintln!("Parse error in {config_path}: {e}");
+    std::process::exit(1);
+  });
+
   smol::block_on(ex.run(async {
-    let config_path = parse_args();
-    let config = Config::load(&config_path);
-    let listen_addr = format!("{}:{}", config.listen_host, config.listen_port);
+    let app = Rc::new(App::new(cfg));
 
-    let app = Arc::new(App::new(&config));
-
-    let socket = Arc::new(UdpSocket::bind(&listen_addr).await.unwrap_or_else(|e| {
-      eprintln!("bind {}: {}", listen_addr, e);
+    let socket = Rc::new(UdpSocket::bind(app.config.listen).await.unwrap_or_else(|e| {
+      eprintln!("bind {:?}: {e}", app.config.listen);
       std::process::exit(1);
     }));
 
-    eprintln!("listening on {listen_addr}");
+    eprintln!("listening on {:?}", app.config.listen);
 
-    let mut buf = vec![0u8; MAX_PKT];
+    let mut buf = [0u8; MAX_PKT];
     loop {
       let (n, src) = match socket.recv_from(&mut buf).await {
         Ok(v) => v,
@@ -290,14 +319,14 @@ fn main() {
       let socket = socket.clone();
 
       ex.spawn(async move {
-        let upstream = app.select_upstream(&qname);
-        let up_label = upstream
+        let rule = app.select_rule(&qname);
+        let label = rule
           .map(|u| u.domains.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","))
           .unwrap_or_else(|| "default".into());
 
-        eprintln!("query: {src} {qname} {qtype:?} upstream={up_label}");
+        eprintln!("query: {src} {qname} {qtype:?} rule={label}");
 
-        if let Some(resp) = app.handle_query(&query, upstream).await {
+        if let Some(resp) = app.handle_query(&query, rule).await {
           eprintln!("response: {src} {qname} len={}", resp.len());
           let _ = socket.send_to(&resp, src).await;
         } else {
