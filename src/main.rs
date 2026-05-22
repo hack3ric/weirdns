@@ -238,49 +238,25 @@ async fn handle_dns64(query: &Message, rule: &Rule) -> Option<Vec<u8>> {
   resp.to_vec().ok()
 }
 
-fn usage(prog: &str) {
-  eprintln!("Usage: {} [-c config.toml]", prog);
-  eprintln!("  -c PATH   path to config file (default: weirdns.toml)");
-  eprintln!("  -h        show this help");
-}
-
-fn parse_args() -> String {
-  let mut config_path = String::from("weirdns.toml");
-  let args: Vec<String> = std::env::args().collect();
-  let mut i = 1;
-  while i < args.len() {
-    match args[i].as_str() {
-      "-c" => {
-        i += 1;
-        if i < args.len() {
-          config_path = args[i].clone();
-        }
-      }
-      "-h" => {
-        usage(&args[0]);
-        std::process::exit(0);
-      }
-      _ => {
-        usage(&args[0]);
-        std::process::exit(1);
-      }
-    }
-    i += 1;
-  }
-  config_path
+#[derive(argh::FromArgs)]
+/// DNS64 gateway proxy
+struct Cli {
+  /// path to config file
+  #[argh(option, short = 'c', default = "String::from(\"weirdns.toml\")")]
+  config: String,
 }
 
 fn main() {
   let ex = smol::LocalExecutor::new();
 
-  let config_path = parse_args();
-  let content = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
-    eprintln!("Cannot open {config_path}: {e}");
+  let cli: Cli = argh::from_env();
+  let content = std::fs::read_to_string(&cli.config).unwrap_or_else(|e| {
+    eprintln!("Cannot open {}: {e}", cli.config);
     std::process::exit(1);
   });
 
   let cfg: Config = toml::from_str(&content).unwrap_or_else(|e| {
-    eprintln!("Parse error in {config_path}: {e}");
+    eprintln!("Parse error in {}: {e}", cli.config);
     std::process::exit(1);
   });
 
