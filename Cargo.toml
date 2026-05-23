@@ -2,7 +2,8 @@
 name = "weirdns"
 version = "1.0.0"
 edition = "2024"
-description = "DNS64 gateway proxy"
+description = "DNS mangler for custom DNS64 behaviours"
+license = "BSD-2-Clause"
 
 [dependencies]
 hickory-proto = { version = "0.26", default-features = false, features = ["std", "serde"] }
@@ -11,6 +12,16 @@ toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_with = "3.20.0"
 argh = "0.1"
+
+[package.metadata.deb]
+maintainer = "Eric Long"
+section = "net"
+assets = [
+    "$auto",
+    ["config.example.toml", "/etc/weirdns.toml", "644"],
+]
+maintainer-scripts = "install/debian"
+systemd-units = {}
 
 [profile.release]
 opt-level = "z"
