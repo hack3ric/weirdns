@@ -28,8 +28,6 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 MemoryDenyWriteExecute=yes
 LockPersonality=yes
-SystemCallFilter=@network-io @basic-io
-SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
