@@ -7,13 +7,15 @@ use hickory_proto::op::Message;
 use hickory_proto::rr::{Name, RecordType};
 use smol::LocalExecutor;
 use smol::future::pending;
-use smol::net::UdpSocket;
+use smol::io::{AsyncReadExt, AsyncWriteExt};
+use smol::net::{TcpListener, UdpSocket};
 use std::mem;
 use std::net::SocketAddr;
 use std::process::exit;
 use std::rc::Rc;
 
 use crate::config::{Config, Rule};
+use crate::dns::Transport;
 
 struct App {
   config: Config,
@@ -32,7 +34,7 @@ impl App {
       .find(|u| u.domains.iter().any(|d| domain_matches(qname, d)))
   }
 
-  async fn handle_query(&self, query: &Message, src: SocketAddr) -> Option<Vec<u8>> {
+  async fn handle_query(&self, query: &Message, src: SocketAddr, transport: Transport) -> Option<Vec<u8>> {
     let root = Name::root();
     let (qname, qtype) = query
       .queries
@@ -58,7 +60,7 @@ impl App {
       && rule.dns64.is_some()
       && qtype == RecordType::AAAA
     {
-      dns64::handle_dns64(query, rule).await
+      dns64::handle_dns64(query, rule, transport).await
     } else {
       let query_bytes = query.to_vec().ok()?;
 
@@ -67,7 +69,7 @@ impl App {
         None => &self.config.upstream[..],
       };
 
-      let resp_bytes = dns::resolve(addresses, &query_bytes, qname).await?;
+      let resp_bytes = dns::resolve(addresses, &query_bytes, qname, transport).await?;
 
       if let Some(rule) = rule
         && rule.strip_a
@@ -121,7 +123,7 @@ async fn run(ex: Rc<LocalExecutor<'static>>, config: Config) {
 
   for addr in app.config.listen.iter().copied() {
     let socket = Rc::new(UdpSocket::bind(addr).await.unwrap_or_else(|e| {
-      eprintln!("error binding {addr}: {e}");
+      eprintln!("error binding UDP {addr}: {e}");
       exit(1);
     }));
 
@@ -129,7 +131,7 @@ async fn run(ex: Rc<LocalExecutor<'static>>, config: Config) {
       let app = app.clone();
       let ex = ex.clone();
       async move {
-        let mut buf = [0u8; dns::MAX_PKT];
+        let mut buf = [0u8; dns::UDP_MAX_PACKET_SIZE];
         loop {
           let (n, src) = match socket.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -151,8 +153,62 @@ async fn run(ex: Rc<LocalExecutor<'static>>, config: Config) {
             let app = app.clone();
             let socket = socket.clone();
             async move {
-              if let Some(resp) = app.handle_query(&query, src).await {
+              if let Some(resp) = app.handle_query(&query, src, Transport::Udp).await {
                 let _ = socket.send_to(&resp, src).await;
+              }
+            }
+          })
+          .detach();
+        }
+      }
+    })
+    .detach();
+  }
+
+  for addr in app.config.listen.iter().copied() {
+    let listener = Rc::new(TcpListener::bind(addr).await.unwrap_or_else(|e| {
+      eprintln!("error binding TCP {addr}: {e}");
+      exit(1);
+    }));
+
+    ex.spawn({
+      let app = app.clone();
+      let ex = ex.clone();
+      async move {
+        loop {
+          let (mut stream, src) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+              eprintln!("tcp accept: {e}");
+              continue;
+            }
+          };
+
+          ex.spawn({
+            let app = app.clone();
+            async move {
+              let mut len_buf = [0u8; 2];
+              if stream.read_exact(&mut len_buf).await.is_err() {
+                return;
+              }
+              let query_len = u16::from_be_bytes(len_buf) as usize;
+              let mut query_buf = vec![0u8; query_len];
+              if stream.read_exact(&mut query_buf).await.is_err() {
+                return;
+              }
+
+              let query = match Message::from_vec(&query_buf) {
+                Ok(q) => q,
+                Err(e) => {
+                  eprintln!("failed to parse TCP query from {src}: {e}");
+                  return;
+                }
+              };
+
+              if let Some(resp) = app.handle_query(&query, src, Transport::Tcp).await {
+                let resp_len = resp.len() as u16;
+                let _ = stream.write_all(&resp_len.to_be_bytes()).await;
+                let _ = stream.write_all(&resp).await;
               }
             }
           })

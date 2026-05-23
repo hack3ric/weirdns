@@ -6,9 +6,9 @@ use hickory_proto::rr::rdata::AAAA;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
 use crate::config::Rule;
-use crate::dns;
+use crate::dns::{self, Transport};
 
-pub async fn handle_dns64(query: &Message, rule: &Rule) -> Option<Either<Message, Vec<u8>>> {
+pub async fn handle_dns64(query: &Message, rule: &Rule, transport: Transport) -> Option<Either<Message, Vec<u8>>> {
   let dns64 = rule.dns64.as_ref()?;
   let prefix = dns64.prefix;
   let root = Name::root();
@@ -16,7 +16,7 @@ pub async fn handle_dns64(query: &Message, rule: &Rule) -> Option<Either<Message
 
   if !dns64.force_synth {
     let aaaa_bytes = query.to_vec().ok()?;
-    let aaaa_resp_bytes = dns::resolve(&rule.upstream, &aaaa_bytes, qname).await?;
+    let aaaa_resp_bytes = dns::resolve(&rule.upstream, &aaaa_bytes, qname, transport).await?;
     let aaaa_resp = Message::from_vec(&aaaa_resp_bytes).ok()?;
 
     if aaaa_resp.answers.iter().any(|rr| rr.record_type() == RecordType::AAAA) {
@@ -33,7 +33,7 @@ pub async fn handle_dns64(query: &Message, rule: &Rule) -> Option<Either<Message
   }
 
   let a_bytes = a_query.to_vec().ok()?;
-  let a_resp_bytes = dns::resolve(&rule.upstream, &a_bytes, qname).await?;
+  let a_resp_bytes = dns::resolve(&rule.upstream, &a_bytes, qname, transport).await?;
   let a_resp = Message::from_vec(&a_resp_bytes).ok()?;
 
   let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
