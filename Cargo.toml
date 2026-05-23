@@ -15,7 +15,7 @@ argh = "0.1"
 either = "1.16.0"
 
 [package.metadata.deb]
-maintainer = "Eric Long"
+maintainer = "Eric Long <i@hack3r.moe>"
 section = "net"
 assets = [
     "$auto",
