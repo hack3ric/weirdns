@@ -4,7 +4,8 @@ use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::AAAA;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
-use crate::{Rule, dns};
+use crate::config::Rule;
+use crate::dns;
 
 pub async fn handle_dns64(query: &Message, rule: &Rule) -> Option<Message> {
   let prefix = rule.dns64_prefix?;
