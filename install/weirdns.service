@@ -17,7 +17,6 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadOnlyPaths=/
-ReadWritePaths=/etc/weirdns
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectClock=yes
