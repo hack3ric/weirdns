@@ -2,6 +2,7 @@ mod config;
 mod dns;
 mod dns64;
 
+use either::Either;
 use hickory_proto::op::Message;
 use hickory_proto::rr::{Name, RecordType};
 use smol::LocalExecutor;
@@ -68,12 +69,11 @@ impl App {
 
       let resp_bytes = dns::resolve(addresses, &query_bytes, qname).await?;
 
-      let mut resp = Message::from_vec(&resp_bytes).ok()?;
-      resp.metadata.id = query.id;
-
       if let Some(rule) = rule
         && rule.strip_a
       {
+        let mut resp = Message::from_vec(&resp_bytes).ok()?;
+        resp.metadata.id = query.id;
         let total = resp.answers.len();
         let answers = mem::take(&mut resp.answers);
         for rr in answers {
@@ -83,11 +83,13 @@ impl App {
         }
         let stripped = total - resp.answers.len();
         eprintln!("strip_a: {qname} stripped={stripped}");
+        Some(Either::Left(resp))
+      } else {
+        Some(Either::Right(resp_bytes))
       }
-      Some(resp)
     };
 
-    if let Some(Ok(resp)) = resp.map(|x| x.to_vec()) {
+    if let Some(Ok(resp)) = resp.map(|x| x.either(|x| x.to_vec(), Ok)) {
       eprintln!("response: {src} {qname} len={}", resp.len());
       Some(resp)
     } else {

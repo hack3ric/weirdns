@@ -1,5 +1,6 @@
 use std::net::Ipv6Addr;
 
+use either::Either;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::AAAA;
 use hickory_proto::rr::{Name, RData, Record, RecordType};
@@ -7,7 +8,7 @@ use hickory_proto::rr::{Name, RData, Record, RecordType};
 use crate::config::Rule;
 use crate::dns;
 
-pub async fn handle_dns64(query: &Message, rule: &Rule) -> Option<Message> {
+pub async fn handle_dns64(query: &Message, rule: &Rule) -> Option<Either<Message, Vec<u8>>> {
   let dns64 = rule.dns64.as_ref()?;
   let prefix = dns64.prefix;
   let root = Name::root();
@@ -19,13 +20,8 @@ pub async fn handle_dns64(query: &Message, rule: &Rule) -> Option<Message> {
     let aaaa_resp = Message::from_vec(&aaaa_resp_bytes).ok()?;
 
     if aaaa_resp.answers.iter().any(|rr| rr.record_type() == RecordType::AAAA) {
-      let mut resp = aaaa_resp;
-      resp.metadata.id = query.id;
-      for q in &query.queries {
-        resp.add_query(q.clone());
-      }
       eprintln!("dns64: {qname} native=AAAA");
-      return Some(resp);
+      return Some(Either::Right(aaaa_resp_bytes));
     }
   }
 
@@ -59,7 +55,7 @@ pub async fn handle_dns64(query: &Message, rule: &Rule) -> Option<Message> {
   }
 
   eprintln!("dns64: {qname} synthesized={n}");
-  Some(resp)
+  Some(Either::Left(resp))
 }
 
 fn synthesize_aaaa(prefix: Ipv6Addr, a_record: &Record) -> Option<Record> {
