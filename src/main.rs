@@ -56,18 +56,18 @@ impl App {
       .map(|q| (q.query_type(), q.name()))
       .unwrap_or((RecordType::A, &root));
 
+    let addresses = match rule {
+      Some(rule) if rule.upstream.is_some() => rule.upstream.as_deref().unwrap(),
+      _ => &self.config.upstream[..],
+    };
+
     let resp = if let Some(rule) = rule
       && rule.dns64.is_some()
       && qtype == RecordType::AAAA
     {
-      dns64::handle_dns64(query, rule, transport).await
+      dns64::handle_dns64(query, rule, addresses, transport).await
     } else {
       let query_bytes = query.to_vec().ok()?;
-
-      let addresses = match rule {
-        Some(rule) => &rule.upstream[..],
-        None => &self.config.upstream[..],
-      };
 
       let resp_bytes = dns::resolve(addresses, &query_bytes, qname, transport).await?;
 

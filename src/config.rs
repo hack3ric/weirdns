@@ -42,10 +42,8 @@ pub struct Config {
 pub struct Rule {
   #[serde_as(as = "OneOrMany<_>")]
   pub domains: Box<[Name]>,
-  #[serde(default)]
-  #[serde_as(as = "OneOrMany<Addr<DNS_PORT>>")]
-  pub upstream: Box<[SocketAddr]>,
-  // pub dns64_prefix: Option<Ipv6Addr>,
+  #[serde_as(as = "Option<OneOrMany<Addr<DNS_PORT>>>")]
+  pub upstream: Option<Box<[SocketAddr]>>,
   pub dns64: Option<Dns64Rule>,
   #[serde(default)]
   pub strip_a: bool,

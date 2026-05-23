@@ -3,7 +3,6 @@ upstream = "1.1.1.1"
 
 [[rule]]
 domains = ["example.com", "example.org", "ipv4only.arpa"]
-upstream = "1.1.1.1"
 strip_a = true
 dns64.prefix = "64:ff9b::"
 
