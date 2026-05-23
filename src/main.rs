@@ -4,6 +4,8 @@ mod dns64;
 
 use hickory_proto::op::Message;
 use hickory_proto::rr::{Name, RecordType};
+use smol::LocalExecutor;
+use smol::future::pending;
 use smol::net::UdpSocket;
 use std::mem;
 use std::net::SocketAddr;
@@ -112,59 +114,74 @@ struct Cli {
   config: String,
 }
 
-fn main() {
-  let ex = smol::LocalExecutor::new();
+async fn run(ex: Rc<LocalExecutor<'static>>, config: Config) {
+  let app = Rc::new(App::new(config));
 
+  for addr in app.config.listen.iter().copied() {
+    let socket = Rc::new(UdpSocket::bind(addr).await.unwrap_or_else(|e| {
+      eprintln!("error binding {addr}: {e}");
+      exit(1);
+    }));
+
+    ex.spawn({
+      let app = app.clone();
+      let ex = ex.clone();
+      async move {
+        let mut buf = [0u8; dns::MAX_PKT];
+        loop {
+          let (n, src) = match socket.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+              eprintln!("recvfrom: {e}");
+              continue;
+            }
+          };
+
+          let query = match Message::from_vec(&buf[..n]) {
+            Ok(q) => q,
+            Err(e) => {
+              eprintln!("failed to parse query from {src}: {e}");
+              continue;
+            }
+          };
+
+          ex.spawn({
+            let app = app.clone();
+            let socket = socket.clone();
+            async move {
+              if let Some(resp) = app.handle_query(&query, src).await {
+                let _ = socket.send_to(&resp, src).await;
+              }
+            }
+          })
+          .detach();
+        }
+      }
+    })
+    .detach();
+  }
+
+  {
+    let addrs_str = format!("{:?}", app.config.listen);
+    let addrs_str = &addrs_str[1..addrs_str.len() - 1];
+    eprintln!("listening on {addrs_str}");
+  }
+
+  pending::<()>().await;
+}
+
+fn main() {
   let cli: Cli = argh::from_env();
   let config_path = cli.config;
   let content = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
     eprintln!("cannot open {config_path}: {e}");
     exit(1);
   });
-  let cfg: Config = toml::from_str(&content).unwrap_or_else(|e| {
+  let config: Config = toml::from_str(&content).unwrap_or_else(|e| {
     eprintln!("parse error in {config_path}: {e}");
     exit(1);
   });
 
-  smol::block_on(ex.run(async {
-    let app = Rc::new(App::new(cfg));
-
-    let comma_separated = format!("{:?}", app.config.listen);
-    let comma_separated = &comma_separated[1..comma_separated.len() - 1];
-    let socket = Rc::new(UdpSocket::bind(&app.config.listen[..]).await.unwrap_or_else(|e| {
-      eprintln!("error binding {comma_separated}: {e}");
-      exit(1);
-    }));
-
-    eprintln!("listening on {comma_separated}");
-
-    let mut buf = [0u8; dns::MAX_PKT];
-    loop {
-      let (n, src) = match socket.recv_from(&mut buf).await {
-        Ok(v) => v,
-        Err(e) => {
-          eprintln!("recvfrom: {e}");
-          continue;
-        }
-      };
-
-      let query = match Message::from_vec(&buf[..n]) {
-        Ok(q) => q,
-        Err(_) => {
-          eprintln!("failed to parse query from {src}");
-          continue;
-        }
-      };
-
-      let app = app.clone();
-      let socket = socket.clone();
-
-      ex.spawn(async move {
-        if let Some(resp) = app.handle_query(&query, src).await {
-          let _ = socket.send_to(&resp, src).await;
-        }
-      })
-      .detach();
-    }
-  }))
+  let ex = Rc::new(smol::LocalExecutor::new());
+  smol::block_on(ex.run(run(ex.clone(), config)))
 }
