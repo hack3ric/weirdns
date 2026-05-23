@@ -8,9 +8,26 @@ use crate::config::Rule;
 use crate::dns;
 
 pub async fn handle_dns64(query: &Message, rule: &Rule) -> Option<Message> {
-  let prefix = rule.dns64_prefix?;
+  let dns64 = rule.dns64.as_ref()?;
+  let prefix = dns64.prefix;
   let root = Name::root();
   let qname = query.queries.first().map(|q| q.name()).unwrap_or(&root);
+
+  if !dns64.force_synth {
+    let aaaa_bytes = query.to_vec().ok()?;
+    let aaaa_resp_bytes = dns::resolve(&rule.upstream, &aaaa_bytes, qname).await?;
+    let aaaa_resp = Message::from_vec(&aaaa_resp_bytes).ok()?;
+
+    if aaaa_resp.answers.iter().any(|rr| rr.record_type() == RecordType::AAAA) {
+      let mut resp = aaaa_resp;
+      resp.metadata.id = query.id;
+      for q in &query.queries {
+        resp.add_query(q.clone());
+      }
+      eprintln!("dns64: {qname} native=AAAA");
+      return Some(resp);
+    }
+  }
 
   let mut a_query = Message::new(query.id, MessageType::Query, OpCode::Query);
   a_query.metadata.recursion_desired = true;

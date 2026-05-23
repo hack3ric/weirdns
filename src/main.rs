@@ -54,7 +54,7 @@ impl App {
       .unwrap_or((RecordType::A, &root));
 
     let resp = if let Some(rule) = rule
-      && rule.dns64_prefix.is_some()
+      && rule.dns64.is_some()
       && qtype == RecordType::AAAA
     {
       dns64::handle_dns64(query, rule).await

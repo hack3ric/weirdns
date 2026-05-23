@@ -6,14 +6,14 @@ use serde_with::{DeserializeAs, OneOrMany, serde_as};
 
 const DNS_PORT: u16 = 53;
 
-struct Addr<const PORT: u16>;
+enum Addr<const PORT: u16> {}
 
 impl<'de, const PORT: u16> DeserializeAs<'de, SocketAddr> for Addr<PORT> {
   fn deserialize_as<D>(d: D) -> Result<SocketAddr, D::Error>
   where
     D: serde::Deserializer<'de>,
   {
-    let s = String::deserialize(d)?;
+    let s = Box::<str>::deserialize(d)?;
     if let Ok(addr) = s.parse::<SocketAddr>() {
       return Ok(addr);
     }
@@ -32,20 +32,29 @@ pub struct Config {
   #[serde_as(as = "OneOrMany<Addr<DNS_PORT>>")]
   pub listen: Box<[SocketAddr]>,
   #[serde_as(as = "OneOrMany<Addr<DNS_PORT>>")]
-  pub upstream: Vec<SocketAddr>,
+  pub upstream: Box<[SocketAddr]>,
   #[serde(rename = "rule")]
-  pub rules: Vec<Rule>,
+  pub rules: Box<[Rule]>,
 }
 
 #[serde_as]
 #[derive(Deserialize)]
 pub struct Rule {
   #[serde_as(as = "OneOrMany<_>")]
-  pub domains: Vec<Name>,
+  pub domains: Box<[Name]>,
   #[serde(default)]
   #[serde_as(as = "OneOrMany<Addr<DNS_PORT>>")]
-  pub upstream: Vec<SocketAddr>,
-  pub dns64_prefix: Option<Ipv6Addr>,
+  pub upstream: Box<[SocketAddr]>,
+  // pub dns64_prefix: Option<Ipv6Addr>,
+  pub dns64: Option<Dns64Rule>,
   #[serde(default)]
   pub strip_a: bool,
+}
+
+#[serde_as]
+#[derive(Deserialize)]
+pub struct Dns64Rule {
+  pub prefix: Ipv6Addr,
+  #[serde(default)]
+  pub force_synth: bool,
 }
