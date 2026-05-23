@@ -104,7 +104,7 @@ fn domain_matches(qname: &Name, domain: &Name) -> bool {
       .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
-/// DNS64 gateway proxy
+/// DNS mangler for custom DNS64 behaviours
 #[derive(argh::FromArgs)]
 struct Cli {
   /// path to config file
