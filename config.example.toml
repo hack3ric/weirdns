@@ -1,21 +1,41 @@
+# Addresses to listen on. Can be a single address or an array.
+# Port defaults to 53 if omitted.
 listen = ["[::1]:5355", "127.0.0.1:5355"]
+
+# Default upstream DNS servers. Used when a rule does not specify its own.
+# Can be a single address or an array. Port defaults to 53 if omitted.
 upstream = "1.1.1.1"
 
+# Each [[rule]] section matches queries for specific domains.
+# Rules are matched by longest domain suffix (trie lookup).
+# Every rule is self-contained -- they do not inherit from each other.
+# The only fallback is `upstream` above, which applies when a rule
+# has no `upstream` of its own.
+
+# DNS64 synthesis + strip A records
 [[rule]]
 domains = ["example.com", "example.org", "ipv4only.arpa"]
 strip_a = true
 dns64_prefix = "64:ff9b::"
 
+# DNS64 with forced synthesis (skips native AAAA lookup)
 [[rule]]
 domains = ["example.net", "httpbin.org"]
-upstream = "8.8.8.8"
+upstream = "8.8.8.8"  # Per-rule upstream override
 dns64_prefix = "2001:db8:64::"
 dns64_force_synth = true
 
+# Custom upstream, no mangling
 [[rule]]
 domains = "github.com"
 upstream = "8.8.8.8"
 
+# Multiple upstreams (tried in order)
 [[rule]]
 domains = "cnki.net"
 upstream = ["223.5.5.5", "223.6.6.6"]
+
+# To match all domains not covered by other rules, use "." as the domain.
+# [[rule]]
+# domains = "."
+# dns64_prefix = "64:ff9b:abcd::"
