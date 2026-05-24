@@ -43,15 +43,9 @@ pub struct Rule {
   pub domains: Box<[Box<str>]>,
   #[serde_as(as = "Option<OneOrMany<Addr<DNS_PORT>>>")]
   pub upstream: Option<Box<[SocketAddr]>>,
-  pub dns64: Option<Dns64Rule>,
+  pub dns64_prefix: Option<Ipv6Addr>,
+  #[serde(default)]
+  pub dns64_force_synth: bool,
   #[serde(default)]
   pub strip_a: bool,
-}
-
-#[serde_as]
-#[derive(Deserialize)]
-pub struct Dns64Rule {
-  pub prefix: Ipv6Addr,
-  #[serde(default)]
-  pub force_synth: bool,
 }

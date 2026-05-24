@@ -4,13 +4,13 @@ upstream = "1.1.1.1"
 [[rule]]
 domains = ["example.com", "example.org", "ipv4only.arpa"]
 strip_a = true
-dns64.prefix = "64:ff9b::"
+dns64_prefix = "64:ff9b::"
 
 [[rule]]
 domains = ["example.net", "httpbin.org"]
 upstream = "8.8.8.8"
-dns64.prefix = "2001:db8:64::"
-dns64.force_synth = true
+dns64_prefix = "2001:db8:64::"
+dns64_force_synth = true
 
 [[rule]]
 domains = "github.com"

@@ -71,7 +71,7 @@ impl App {
     };
 
     let resp = if let Some(rule) = rule
-      && rule.dns64.is_some()
+      && rule.dns64_prefix.is_some()
       && qtype == RecordType::AAAA
     {
       dns64::handle_dns64(query, rule, addresses, transport).await

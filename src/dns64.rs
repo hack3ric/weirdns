@@ -14,12 +14,11 @@ pub async fn handle_dns64(
   upstream: &[SocketAddr],
   transport: Transport,
 ) -> Option<Either<Message, Vec<u8>>> {
-  let dns64 = rule.dns64.as_ref()?;
-  let prefix = dns64.prefix;
+  let prefix = rule.dns64_prefix?;
   let root = Name::root();
   let qname = query.queries.first().map(|q| q.name()).unwrap_or(&root);
 
-  if !dns64.force_synth {
+  if !rule.dns64_force_synth {
     let aaaa_bytes = query.to_vec().ok()?;
     let aaaa_resp_bytes = dns::resolve(upstream, &aaaa_bytes, qname, transport).await?;
     let aaaa_resp = Message::from_vec(&aaaa_resp_bytes).ok()?;
