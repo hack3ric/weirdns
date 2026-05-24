@@ -3,8 +3,11 @@ mod dns;
 mod dns64;
 
 use either::Either;
+use fqdn::FQDN;
+use fqdn_trie::FqdnTrieMap;
 use hickory_proto::op::Message;
 use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::serialize::binary::BinEncodable;
 use smol::LocalExecutor;
 use smol::future::pending;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,19 +22,25 @@ use crate::dns::Transport;
 
 struct App {
   config: Config,
+  trie: FqdnTrieMap<FQDN, Option<usize>>,
 }
 
 impl App {
   fn new(config: Config) -> Self {
-    App { config }
+    let mut trie = FqdnTrieMap::with_key_root(FQDN::default(), None);
+    for (idx, rule) in config.rules.iter().enumerate() {
+      for domain in rule.domains.iter() {
+        let fqdn = FQDN::from_ascii_str(domain).expect("invalid domain in config");
+        trie.insert(fqdn, Some(idx));
+      }
+    }
+    App { config, trie }
   }
 
   fn select_rule(&self, qname: &Name) -> Option<&Rule> {
-    self
-      .config
-      .rules
-      .iter()
-      .find(|u| u.domains.iter().any(|d| domain_matches(qname, d)))
+    let fqdn = qname.to_bytes().ok().and_then(|b| FQDN::try_from(b).ok())?;
+    let idx = *self.trie.lookup(&fqdn);
+    idx.map(|i| &self.config.rules[i])
   }
 
   async fn handle_query(&self, query: &Message, src: SocketAddr, transport: Transport) -> Option<Vec<u8>> {
@@ -99,15 +108,6 @@ impl App {
       None
     }
   }
-}
-
-fn domain_matches(qname: &Name, domain: &Name) -> bool {
-  qname.num_labels() >= domain.num_labels()
-    && qname
-      .iter()
-      .rev()
-      .zip(domain.iter().rev())
-      .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
 /// DNS mangler for custom DNS64 behaviours

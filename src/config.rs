@@ -1,6 +1,5 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-use hickory_proto::rr::Name;
 use serde::Deserialize;
 use serde_with::{DeserializeAs, OneOrMany, serde_as};
 
@@ -41,7 +40,7 @@ pub struct Config {
 #[derive(Deserialize)]
 pub struct Rule {
   #[serde_as(as = "OneOrMany<_>")]
-  pub domains: Box<[Name]>,
+  pub domains: Box<[Box<str>]>,
   #[serde_as(as = "Option<OneOrMany<Addr<DNS_PORT>>>")]
   pub upstream: Option<Box<[SocketAddr]>>,
   pub dns64: Option<Dns64Rule>,

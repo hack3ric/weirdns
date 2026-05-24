@@ -448,6 +448,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fqdn"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "886ac788f62d16d6b0f26b2fa762b34ef16ebfb4b624c2c15fbcadc9173c0f72"
+
+[[package]]
+name = "fqdn-trie"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1990ce5b8b1ad7a22dadb8d4b147fafe963be47943664263a25802be0ebdbcaf"
+dependencies = [
+ "fqdn",
+]
+
+[[package]]
 name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1557,6 +1572,8 @@ version = "0.1.0"
 dependencies = [
  "argh",
  "either",
+ "fqdn",
+ "fqdn-trie",
  "hickory-proto",
  "serde",
  "serde_with",
