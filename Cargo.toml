@@ -10,7 +10,7 @@ maintainer = "Eric Long <i@hack3r.moe>"
 section = "net"
 assets = [
   "$auto",
-  ["config.example.toml", "/etc/weirdns.toml", "644"],
+  ["config.example.toml", "/etc/weirdns/weirdns.toml", "644"],
 ]
 maintainer-scripts = "install/debian"
 systemd-units = {}

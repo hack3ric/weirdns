@@ -6,7 +6,7 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/weirdns -c /etc/weirdns.toml
+ExecStart=/usr/bin/weirdns -c /etc/weirdns/weirdns.toml
 Restart=on-failure
 RestartSec=5s
 
