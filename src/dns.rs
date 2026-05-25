@@ -89,7 +89,12 @@ async fn tcp_query(addr: SocketAddr, query: &[u8], qname: &Name, log_enabled: bo
   handle_upstream_result(result, addr, qname, log_enabled)
 }
 
-fn handle_upstream_result(result: io::Result<Vec<u8>>, addr: SocketAddr, qname: &Name, log_enabled: bool) -> Option<Vec<u8>> {
+fn handle_upstream_result(
+  result: io::Result<Vec<u8>>,
+  addr: SocketAddr,
+  qname: &Name,
+  log_enabled: bool,
+) -> Option<Vec<u8>> {
   match result {
     Ok(resp) => Some(resp),
     Err(e) => {

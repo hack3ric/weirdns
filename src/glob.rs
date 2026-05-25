@@ -61,8 +61,7 @@ pub(crate) fn parse_domain_pattern(domain: &str) -> Option<(FQDN, Box<[LabelPatt
     FQDN::from_ascii_str(&s).ok()?
   };
 
-  let prefix: Box<[LabelPattern]> =
-    labels[..suffix_start].iter().map(|l| parse_label(l)).rev().collect();
+  let prefix: Box<[LabelPattern]> = labels[..suffix_start].iter().map(|l| parse_label(l)).rev().collect();
 
   Some((suffix, prefix))
 }
@@ -145,7 +144,10 @@ mod tests {
   #[test]
   fn literal_labels_only_suffix_is_full_domain() {
     let (suffix, prefix) = parse_domain_pattern("*-a.*-b.example.com").unwrap();
-    assert_eq!(suffix.as_bytes(), FQDN::from_ascii_str("example.com").unwrap().as_bytes());
+    assert_eq!(
+      suffix.as_bytes(),
+      FQDN::from_ascii_str("example.com").unwrap().as_bytes()
+    );
     assert_eq!(prefix.len(), 2);
     assert!(matches!(&prefix[0], LabelPattern::Glob(_))); // *-b (closest to suffix)
     assert!(matches!(&prefix[1], LabelPattern::Glob(_))); // *-a (leftmost)
@@ -154,7 +156,10 @@ mod tests {
   #[test]
   fn any_label_wildcard() {
     let (suffix, prefix) = parse_domain_pattern("*.example.com").unwrap();
-    assert_eq!(suffix.as_bytes(), FQDN::from_ascii_str("example.com").unwrap().as_bytes());
+    assert_eq!(
+      suffix.as_bytes(),
+      FQDN::from_ascii_str("example.com").unwrap().as_bytes()
+    );
     assert_eq!(prefix.len(), 1);
     assert!(matches!(&prefix[0], LabelPattern::AnyLabel));
   }
@@ -205,11 +210,23 @@ mod tests {
 
   #[test]
   fn match_with_literal_labels_mixed() {
-    assert!(glob_matches("prefix-*-suffix.example.com", "prefix-123-suffix.example.com"));
-    assert!(glob_matches("prefix-*-suffix.example.com", "prefix-hello-suffix.example.com"));
-    assert!(!glob_matches("prefix-*-suffix.example.com", "other-123-suffix.example.com"));
+    assert!(glob_matches(
+      "prefix-*-suffix.example.com",
+      "prefix-123-suffix.example.com"
+    ));
+    assert!(glob_matches(
+      "prefix-*-suffix.example.com",
+      "prefix-hello-suffix.example.com"
+    ));
+    assert!(!glob_matches(
+      "prefix-*-suffix.example.com",
+      "other-123-suffix.example.com"
+    ));
     // * can match any chars within a label, including hyphens
-    assert!(glob_matches("prefix-*-suffix.example.com", "prefix-abc-def-suffix.example.com"));
+    assert!(glob_matches(
+      "prefix-*-suffix.example.com",
+      "prefix-abc-def-suffix.example.com"
+    ));
   }
 
   #[test]
@@ -279,4 +296,3 @@ mod tests {
     assert!(glob_matches("*", "com"));
   }
 }
-

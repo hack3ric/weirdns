@@ -317,7 +317,11 @@ mod tests {
 
   fn make_rule(domains: &[&str]) -> crate::config::Rule {
     crate::config::Rule {
-      domains: domains.iter().map(|d| Box::<str>::from(*d)).collect::<Vec<_>>().into_boxed_slice(),
+      domains: domains
+        .iter()
+        .map(|d| Box::<str>::from(*d))
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
       upstream: None,
       dns64_prefix: None,
       dns64_force_synth: false,
@@ -352,23 +356,30 @@ mod tests {
 
   #[test]
   fn integration_glob_within_label() {
-    let rules = vec![make_rule(
-      &["chatgpt-async-webps-prod-*-*.webpubsub.azure.com"]
-    )];
+    let rules = vec![make_rule(&["chatgpt-async-webps-prod-*-*.webpubsub.azure.com"])];
     let app = App::new(make_config(rules), false);
-    assert!(app.select_rule(&name("chatgpt-async-webps-prod-someid-123.webpubsub.azure.com")).is_some());
-    assert!(app.select_rule(&name("chatgpt-async-webps-prod-abc-42.webpubsub.azure.com")).is_some());
+    assert!(
+      app
+        .select_rule(&name("chatgpt-async-webps-prod-someid-123.webpubsub.azure.com"))
+        .is_some()
+    );
+    assert!(
+      app
+        .select_rule(&name("chatgpt-async-webps-prod-abc-42.webpubsub.azure.com"))
+        .is_some()
+    );
     assert!(!app.select_rule(&name("other-prod-someid-123.webpubsub.azure.com")).is_some());
     // subdomain: should match
-    assert!(app.select_rule(&name("x.chatgpt-async-webps-prod-someid-123.webpubsub.azure.com")).is_some());
+    assert!(
+      app
+        .select_rule(&name("x.chatgpt-async-webps-prod-someid-123.webpubsub.azure.com"))
+        .is_some()
+    );
   }
 
   #[test]
   fn integration_exact_priority_over_glob() {
-    let rules = vec![
-      make_rule(&["*.example.com"]),
-      make_rule(&["exact.example.com"]),
-    ];
+    let rules = vec![make_rule(&["*.example.com"]), make_rule(&["exact.example.com"])];
     let app = App::new(make_config(rules), false);
     let r = app.select_rule(&name("exact.example.com")).unwrap();
     assert_eq!(r.domains.join(","), "exact.example.com");
@@ -392,4 +403,3 @@ mod tests {
     assert!(app.select_rule(&name("com")).is_some());
   }
 }
-
