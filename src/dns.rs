@@ -79,10 +79,8 @@ async fn tcp_query(addr: SocketAddr, query: &[u8], qname: &Name, log_enabled: bo
     let mut stream = TcpStream::connect(addr).await?;
 
     let len = query.len() as u16;
-    let mut packet = Vec::with_capacity(2 + query.len());
-    packet.extend_from_slice(&len.to_be_bytes());
-    packet.extend_from_slice(query);
-    stream.write_all(&packet).await?;
+    stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(query).await?;
 
     let mut len_buf = [0u8; 2];
     stream.read_exact(&mut len_buf).await?;

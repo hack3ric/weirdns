@@ -12,7 +12,7 @@ use smol::LocalExecutor;
 use smol::future::pending;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
 use smol::net::{TcpListener, UdpSocket};
-use std::mem;
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::process::exit;
 use std::rc::Rc;
@@ -52,11 +52,9 @@ impl App {
       .unwrap_or_else(|| (RecordType::A, Name::root()));
 
     let rule = self.select_rule(&qname);
-    let label = rule
-      .map(|u| u.domains.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","))
-      .unwrap_or_else(|| "default".into());
 
     if self.log_enabled {
+      let label: Cow<'static, str> = rule.map(|u| u.domains.join(",").into()).unwrap_or_else(|| "default".into());
       eprintln!("query: {src} {qname} {qtype:?} rule={label}");
     }
 
@@ -89,12 +87,7 @@ impl App {
         if qtype == RecordType::A {
           resp.answers.clear();
         } else {
-          let answers = mem::take(&mut resp.answers);
-          for rr in answers {
-            if rr.record_type() != RecordType::A {
-              resp.add_answer(rr);
-            }
-          }
+          resp.answers.retain(|rr| rr.record_type() != RecordType::A);
         }
         let stripped = total - resp.answers.len();
         if self.log_enabled {
@@ -234,9 +227,8 @@ async fn run(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) 
   }
 
   {
-    let addrs_str = format!("{:?}", app.config.listen);
-    let addrs_str = &addrs_str[1..addrs_str.len() - 1];
-    eprintln!("listening on {addrs_str}");
+    let addrs_str: Vec<String> = app.config.listen.iter().map(|a| a.to_string()).collect();
+    eprintln!("listening on {}", addrs_str.join(", "));
   }
 
   pending::<()>().await;
