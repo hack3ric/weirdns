@@ -1,6 +1,7 @@
 mod config;
 mod dns;
 mod dns64;
+mod glob;
 
 use either::Either;
 use fqdn::FQDN;
@@ -19,20 +20,42 @@ use std::rc::Rc;
 
 use crate::config::{Config, Rule};
 use crate::dns::Transport;
+use crate::glob::{GlobValue, RuleValue, contains_glob, parse_domain_pattern};
 
 struct App {
   config: Config,
-  trie: FqdnTrieMap<FQDN, Option<usize>>,
+  trie: FqdnTrieMap<FQDN, RuleValue>,
   log_enabled: bool,
 }
 
 impl App {
   fn new(config: Config, log_enabled: bool) -> Self {
-    let mut trie = FqdnTrieMap::with_key_root(FQDN::default(), None);
+    let mut trie = FqdnTrieMap::with_key_root(FQDN::default(), RuleValue::default());
     for (idx, rule) in config.rules.iter().enumerate() {
       for domain in rule.domains.iter() {
-        let fqdn = FQDN::from_ascii_str(domain).expect("invalid domain in config");
-        trie.insert(fqdn, Some(idx));
+        if contains_glob(domain) {
+          if let Some((suffix, prefix)) = parse_domain_pattern(domain) {
+            let gv = GlobValue { prefix, rule: idx };
+            match trie.get_mut(&suffix) {
+              Some(value) => value.globs.push(gv),
+              None => {
+                let mut value = RuleValue::default();
+                value.globs.push(gv);
+                trie.insert(suffix, value);
+              }
+            }
+          }
+        } else {
+          let fqdn = FQDN::from_ascii_str(domain).expect("invalid domain in config");
+          match trie.get_mut(&fqdn) {
+            Some(value) => value.exact = Some(idx),
+            None => {
+              let mut value = RuleValue::default();
+              value.exact = Some(idx);
+              trie.insert(fqdn, value);
+            }
+          }
+        }
       }
     }
     App { config, trie, log_enabled }
@@ -40,8 +63,16 @@ impl App {
 
   fn select_rule(&self, qname: &Name) -> Option<&Rule> {
     let fqdn = qname.to_bytes().ok().and_then(|b| FQDN::try_from(b).ok())?;
-    let idx = *self.trie.lookup(&fqdn);
-    idx.map(|i| &self.config.rules[i])
+    let (suffix, value) = self.trie.lookup_key_value(&fqdn);
+    if let Some(idx) = value.exact {
+      return Some(&self.config.rules[idx]);
+    }
+    for gv in &value.globs {
+      if gv.matches(&fqdn, suffix.as_ref()) {
+        return Some(&self.config.rules[gv.rule]);
+      }
+    }
+    None
   }
 
   async fn handle_query(&self, query: Message, src: SocketAddr, transport: Transport) -> Option<Vec<u8>> {
@@ -251,3 +282,96 @@ fn main() {
   let ex = Rc::new(smol::LocalExecutor::new());
   smol::block_on(ex.run(run(ex.clone(), config, log_enabled)))
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use hickory_proto::rr::Name;
+
+  fn make_config(rules: Vec<crate::config::Rule>) -> Config {
+    Config {
+      listen: Box::new([]),
+      default_upstream: Box::new([]),
+      rules: rules.into_boxed_slice(),
+      enable_logging: false,
+    }
+  }
+
+  fn make_rule(domains: &[&str]) -> crate::config::Rule {
+    crate::config::Rule {
+      domains: domains.iter().map(|d| Box::<str>::from(*d)).collect::<Vec<_>>().into_boxed_slice(),
+      upstream: None,
+      dns64_prefix: None,
+      dns64_force_synth: false,
+      strip_a: false,
+    }
+  }
+
+  fn name(s: &str) -> Name {
+    let fqdn_str = if s.ends_with('.') { s.into() } else { format!("{s}.") };
+    Name::from_ascii(&fqdn_str).unwrap()
+  }
+
+  #[test]
+  fn integration_exact_match() {
+    let rules = vec![make_rule(&["example.com"]), make_rule(&["other.com"])];
+    let app = App::new(make_config(rules), false);
+    assert!(app.select_rule(&name("example.com")).is_some());
+    assert!(app.select_rule(&name("sub.example.com")).is_some());
+    assert!(app.select_rule(&name("other.com")).is_some());
+    assert!(app.select_rule(&name("unmatched.com")).is_none());
+  }
+
+  #[test]
+  fn integration_glob_single_wildcard_label() {
+    let rules = vec![make_rule(&["*.example.com"])];
+    let app = App::new(make_config(rules), false);
+    assert!(app.select_rule(&name("foo.example.com")).is_some());
+    assert!(app.select_rule(&name("bar.example.com")).is_some());
+    assert!(app.select_rule(&name("sub.foo.example.com")).is_some());
+    assert!(app.select_rule(&name("foo.other.com")).is_none());
+  }
+
+  #[test]
+  fn integration_glob_within_label() {
+    let rules = vec![make_rule(
+      &["chatgpt-async-webps-prod-*-*.webpubsub.azure.com"]
+    )];
+    let app = App::new(make_config(rules), false);
+    assert!(app.select_rule(&name("chatgpt-async-webps-prod-someid-123.webpubsub.azure.com")).is_some());
+    assert!(app.select_rule(&name("chatgpt-async-webps-prod-abc-42.webpubsub.azure.com")).is_some());
+    assert!(!app.select_rule(&name("other-prod-someid-123.webpubsub.azure.com")).is_some());
+    // subdomain: should match
+    assert!(app.select_rule(&name("x.chatgpt-async-webps-prod-someid-123.webpubsub.azure.com")).is_some());
+  }
+
+  #[test]
+  fn integration_exact_priority_over_glob() {
+    let rules = vec![
+      make_rule(&["*.example.com"]),
+      make_rule(&["exact.example.com"]),
+    ];
+    let app = App::new(make_config(rules), false);
+    let r = app.select_rule(&name("exact.example.com")).unwrap();
+    assert_eq!(r.domains.join(","), "exact.example.com");
+  }
+
+  #[test]
+  fn integration_question_mark() {
+    let rules = vec![make_rule(&["app-?.example.com"])];
+    let app = App::new(make_config(rules), false);
+    assert!(app.select_rule(&name("app-1.example.com")).is_some());
+    assert!(app.select_rule(&name("app-x.example.com")).is_some());
+    assert!(!app.select_rule(&name("app-12.example.com")).is_some());
+  }
+
+  #[test]
+  fn integration_glob_at_root_match_any() {
+    let rules = vec![make_rule(&["*"])];
+    let app = App::new(make_config(rules), false);
+    assert!(app.select_rule(&name("example.com")).is_some());
+    assert!(app.select_rule(&name("foo.bar.example.com")).is_some());
+    assert!(app.select_rule(&name("com")).is_some());
+  }
+}
+

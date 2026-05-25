@@ -15,7 +15,7 @@ default_upstream = "1.1.1.1"
 
 # DNS64 synthesis + strip A records
 [[rule]]
-domains = ["example.com", "example.org", "ipv4only.arpa", "b.9.f.f.4.6.0.0.ip6.arpa"]
+domains = ["exampl*.com", "example.org", "ipv4only.arpa", "b.9.f.f.4.6.0.0.ip6.arpa"]
 strip_a = true
 dns64_prefix = "64:ff9b::"
 
