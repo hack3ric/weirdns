@@ -1575,6 +1575,7 @@ dependencies = [
  "fqdn",
  "fqdn-trie",
  "hickory-proto",
+ "ipnet",
  "serde",
  "serde_with",
  "smol",

@@ -25,6 +25,7 @@ argh = "0.1"
 either = "1.16.0"
 fqdn = "0.5"
 fqdn-trie = "0.5"
+ipnet = "2"
 
 [profile.release]
 opt-level = "z"

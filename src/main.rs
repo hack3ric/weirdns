@@ -44,15 +44,14 @@ impl App {
     idx.map(|i| &self.config.rules[i])
   }
 
-  async fn handle_query(&self, query: &Message, src: SocketAddr, transport: Transport) -> Option<Vec<u8>> {
-    let root = Name::root();
-    let (qname, qtype) = query
+  async fn handle_query(&self, query: Message, src: SocketAddr, transport: Transport) -> Option<Vec<u8>> {
+    let (qtype, qname) = query
       .queries
       .first()
-      .map(|q| (q.name(), q.query_type()))
-      .unwrap_or((&root, RecordType::A));
+      .map(|q| (q.query_type(), q.name().clone()))
+      .unwrap_or_else(|| (RecordType::A, Name::root()));
 
-    let rule = self.select_rule(qname);
+    let rule = self.select_rule(&qname);
     let label = rule
       .map(|u| u.domains.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","))
       .unwrap_or_else(|| "default".into());
@@ -60,13 +59,6 @@ impl App {
     if self.log_enabled {
       eprintln!("query: {src} {qname} {qtype:?} rule={label}");
     }
-
-    let root = Name::root();
-    let (qtype, qname) = query
-      .queries
-      .first()
-      .map(|q| (q.query_type(), q.name()))
-      .unwrap_or((RecordType::A, &root));
 
     let addresses = match rule {
       Some(rule) if rule.upstream.is_some() => rule.upstream.as_deref().unwrap(),
@@ -78,10 +70,15 @@ impl App {
       && qtype == RecordType::AAAA
     {
       dns64::handle_dns64(query, rule, addresses, transport, self.log_enabled).await
+    } else if let Some(rule) = rule
+      && rule.dns64_prefix.is_some()
+      && qtype == RecordType::PTR
+    {
+      dns64::handle_dns64_rdns(query, rule, addresses, transport, self.log_enabled).await
     } else {
       let query_bytes = query.to_vec().ok()?;
 
-      let resp_bytes = dns::resolve(addresses, &query_bytes, qname, transport, self.log_enabled).await?;
+      let resp_bytes = dns::resolve(addresses, &query_bytes, &qname, transport, self.log_enabled).await?;
 
       if let Some(rule) = rule
         && rule.strip_a
@@ -170,7 +167,7 @@ async fn run(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) 
             let app = app.clone();
             let socket = socket.clone();
             async move {
-              if let Some(resp) = app.handle_query(&query, src, Transport::Udp).await {
+              if let Some(resp) = app.handle_query(query, src, Transport::Udp).await {
                 let _ = socket.send_to(&resp, src).await;
               }
             }
@@ -222,7 +219,7 @@ async fn run(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) 
                 }
               };
 
-              if let Some(resp) = app.handle_query(&query, src, Transport::Tcp).await {
+              if let Some(resp) = app.handle_query(query, src, Transport::Tcp).await {
                 let resp_len = resp.len() as u16;
                 let _ = stream.write_all(&resp_len.to_be_bytes()).await;
                 let _ = stream.write_all(&resp).await;

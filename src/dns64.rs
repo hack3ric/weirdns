@@ -1,9 +1,10 @@
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use either::Either;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::{AAAA, CNAME};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
+use ipnet::IpNet;
 
 use crate::config::Rule;
 use crate::dns::{self, Transport};
@@ -11,7 +12,7 @@ use crate::dns::{self, Transport};
 const MAX_CNAME_DEPTH: usize = 11;
 
 pub async fn handle_dns64(
-  query: &Message,
+  query: Message,
   rule: &Rule,
   upstream: &[SocketAddr],
   transport: Transport,
@@ -91,7 +92,9 @@ async fn chase_a(
       return Some(all_records);
     }
 
-    let cname_target = a_resp.answers.iter()
+    let cname_target = a_resp
+      .answers
+      .iter()
       .find(|rr| rr.record_type() == RecordType::CNAME)
       .and_then(extract_cname_target)
       .cloned();
@@ -125,6 +128,65 @@ fn extract_cname_target(rr: &Record) -> Option<&Name> {
     RData::CNAME(CNAME(target)) => Some(target),
     _ => None,
   }
+}
+
+pub async fn handle_dns64_rdns(
+  query: Message,
+  rule: &Rule,
+  upstream: &[SocketAddr],
+  transport: Transport,
+  log_enabled: bool,
+) -> Option<Either<Message, Vec<u8>>> {
+  let prefix = rule.dns64_prefix?;
+  let root = Name::root();
+  let qname = query.queries[..].first().map(|q| q.name()).unwrap_or(&root);
+
+  let ipnet = qname.parse_arpa_name().ok()?;
+  let ipv6 = match ipnet {
+    IpNet::V6(v6net) => v6net.addr(),
+    _ => {
+      let query_bytes = query.to_vec().ok()?;
+      let resp_bytes = dns::resolve(upstream, &query_bytes, qname, transport, log_enabled).await?;
+      return Some(Either::Right(resp_bytes));
+    }
+  };
+
+  let prefix_bytes = prefix.octets();
+  let addr_bytes = ipv6.octets();
+  if addr_bytes[..12] != prefix_bytes[..12] {
+    let query_bytes = query.to_vec().ok()?;
+    let resp_bytes = dns::resolve(upstream, &query_bytes, qname, transport, log_enabled).await?;
+    return Some(Either::Right(resp_bytes));
+  }
+
+  let ipv4 = Ipv4Addr::new(addr_bytes[12], addr_bytes[13], addr_bytes[14], addr_bytes[15]);
+  let ptr_name: Name = ipv4.into();
+
+  let mut ptr_query = Message::new(query.id, MessageType::Query, OpCode::Query);
+  ptr_query.metadata.recursion_desired = true;
+  ptr_query.add_query(hickory_proto::op::Query::query(ptr_name.clone(), RecordType::PTR));
+
+  let ptr_bytes = ptr_query.to_vec().ok()?;
+  let resp_bytes = dns::resolve(upstream, &ptr_bytes, &ptr_name, transport, log_enabled).await?;
+  let mut resp = Message::from_vec(&resp_bytes).ok()?;
+  resp.metadata.id = query.id;
+
+  for rr in &mut resp.answers {
+    rr.name = qname.clone();
+  }
+  for rr in &mut resp.authorities {
+    rr.name = qname.clone();
+  }
+  for rr in &mut resp.additionals {
+    rr.name = qname.clone();
+  }
+
+  if log_enabled {
+    eprintln!("dns64_rdns: {qname} -> {ipv4}");
+  }
+  resp.queries = query.queries;
+
+  Some(Either::Left(resp))
 }
 
 fn synthesize_aaaa(prefix: Ipv6Addr, name: &Name, a_record: &Record) -> Option<Record> {
