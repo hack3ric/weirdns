@@ -89,10 +89,14 @@ impl App {
         let mut resp = Message::from_vec(&resp_bytes).ok()?;
         resp.metadata.id = query.id;
         let total = resp.answers.len();
-        let answers = mem::take(&mut resp.answers);
-        for rr in answers {
-          if rr.record_type() != RecordType::A {
-            resp.add_answer(rr);
+        if qtype == RecordType::A {
+          resp.answers.clear();
+        } else {
+          let answers = mem::take(&mut resp.answers);
+          for rr in answers {
+            if rr.record_type() != RecordType::A {
+              resp.add_answer(rr);
+            }
           }
         }
         let stripped = total - resp.answers.len();
