@@ -67,7 +67,7 @@ impl App {
 
     let addresses = match rule {
       Some(rule) if rule.upstream.is_some() => rule.upstream.as_deref().unwrap(),
-      _ => &self.config.upstream[..],
+      _ => &self.config.default_upstream[..],
     };
 
     let resp = if let Some(rule) = rule

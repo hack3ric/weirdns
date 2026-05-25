@@ -31,7 +31,7 @@ pub struct Config {
   #[serde_as(as = "OneOrMany<Addr<DNS_PORT>>")]
   pub listen: Box<[SocketAddr]>,
   #[serde_as(as = "OneOrMany<Addr<DNS_PORT>>")]
-  pub upstream: Box<[SocketAddr]>,
+  pub default_upstream: Box<[SocketAddr]>,
   #[serde(rename = "rule")]
   pub rules: Box<[Rule]>,
 }
