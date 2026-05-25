@@ -59,19 +59,7 @@ async fn udp_query(addr: SocketAddr, query: &[u8], qname: &Name, log_enabled: bo
     })
     .await;
 
-  match result {
-    Ok(resp) => Some(resp),
-    Err(e) => {
-      if log_enabled {
-        if e.kind() == io::ErrorKind::TimedOut {
-          eprintln!("upstream timeout: {addr:?}, {qname}");
-        } else {
-          eprintln!("upstream error: {addr:?}, {qname}: {e}");
-        }
-      }
-      None
-    }
-  }
+  handle_upstream_result(result, addr, qname, log_enabled)
 }
 
 async fn tcp_query(addr: SocketAddr, query: &[u8], qname: &Name, log_enabled: bool) -> Option<Vec<u8>> {
@@ -98,6 +86,10 @@ async fn tcp_query(addr: SocketAddr, query: &[u8], qname: &Name, log_enabled: bo
     })
     .await;
 
+  handle_upstream_result(result, addr, qname, log_enabled)
+}
+
+fn handle_upstream_result(result: io::Result<Vec<u8>>, addr: SocketAddr, qname: &Name, log_enabled: bool) -> Option<Vec<u8>> {
   match result {
     Ok(resp) => Some(resp),
     Err(e) => {

@@ -89,6 +89,7 @@ fn label_matches(pattern: &LabelPattern, label: &[u8]) -> bool {
 
 fn glob_match(pat: &[u8], input: &[u8]) -> bool {
   let m = input.len();
+  // DNS labels are max 63 octets (RFC 1035), so 64 is sufficient
   let mut dp = [false; 64];
   dp[0] = true;
 

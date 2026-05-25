@@ -12,7 +12,7 @@ use hickory_proto::serialize::binary::BinEncodable;
 use smol::LocalExecutor;
 use smol::future::pending;
 use smol::io::{AsyncReadExt, AsyncWriteExt};
-use smol::net::{TcpListener, UdpSocket};
+use smol::net::{TcpListener, TcpStream, UdpSocket};
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::process::exit;
@@ -89,48 +89,13 @@ impl App {
       eprintln!("query: {src} {qname} {qtype:?} rule={label}");
     }
 
-    let addresses = match rule {
-      Some(rule) if rule.upstream.is_some() => rule.upstream.as_deref().unwrap(),
-      _ => &self.config.default_upstream[..],
-    };
+    let addresses = rule
+      .and_then(|r| r.upstream.as_deref())
+      .unwrap_or(&self.config.default_upstream[..]);
 
-    let resp = if let Some(rule) = rule
-      && rule.dns64_prefix.is_some()
-      && qtype == RecordType::AAAA
-    {
-      dns64::handle_dns64(query, rule, addresses, transport, self.log_enabled).await
-    } else if let Some(rule) = rule
-      && rule.dns64_prefix.is_some()
-      && qtype == RecordType::PTR
-    {
-      dns64::handle_dns64_rdns(query, rule, addresses, transport, self.log_enabled).await
-    } else {
-      let query_bytes = query.to_vec().ok()?;
+    let resp = self.resolve_query(query, &qname, qtype, rule, addresses, transport).await;
 
-      let resp_bytes = dns::resolve(addresses, &query_bytes, &qname, transport, self.log_enabled).await?;
-
-      if let Some(rule) = rule
-        && rule.strip_a
-      {
-        let mut resp = Message::from_vec(&resp_bytes).ok()?;
-        resp.metadata.id = query.id;
-        let total = resp.answers.len();
-        if qtype == RecordType::A {
-          resp.answers.clear();
-        } else {
-          resp.answers.retain(|rr| rr.record_type() != RecordType::A);
-        }
-        let stripped = total - resp.answers.len();
-        if self.log_enabled {
-          eprintln!("strip_a: {qname} stripped={stripped}");
-        }
-        Some(Either::Left(resp))
-      } else {
-        Some(Either::Right(resp_bytes))
-      }
-    };
-
-    if let Some(Ok(resp)) = resp.map(|x| x.either(|x| x.to_vec(), Ok)) {
+    if let Some(resp) = resp {
       if self.log_enabled {
         eprintln!("response: {src} {qname} len={}", resp.len());
       }
@@ -141,6 +106,55 @@ impl App {
       }
       None
     }
+  }
+
+  async fn resolve_query(
+    &self,
+    query: Message,
+    qname: &Name,
+    qtype: RecordType,
+    rule: Option<&Rule>,
+    addresses: &[SocketAddr],
+    transport: Transport,
+  ) -> Option<Vec<u8>> {
+    match (rule, qtype) {
+      (Some(rule), RecordType::AAAA) if rule.dns64_prefix.is_some() => {
+        match dns64::handle_dns64(query, rule, addresses, transport, self.log_enabled).await? {
+          Either::Left(msg) => msg.to_vec().ok(),
+          Either::Right(bytes) => Some(bytes),
+        }
+      }
+      (Some(rule), RecordType::PTR) if rule.dns64_prefix.is_some() => {
+        match dns64::handle_dns64_rdns(query, rule, addresses, transport, self.log_enabled).await? {
+          Either::Left(msg) => msg.to_vec().ok(),
+          Either::Right(bytes) => Some(bytes),
+        }
+      }
+      _ => {
+        let query_bytes = query.to_vec().ok()?;
+        let resp_bytes = dns::resolve(addresses, &query_bytes, qname, transport, self.log_enabled).await?;
+        match rule {
+          Some(rule) if rule.strip_a => self.apply_strip_a(qname, query.id, qtype, resp_bytes),
+          _ => Some(resp_bytes),
+        }
+      }
+    }
+  }
+
+  fn apply_strip_a(&self, qname: &Name, query_id: u16, qtype: RecordType, resp_bytes: Vec<u8>) -> Option<Vec<u8>> {
+    let mut resp = Message::from_vec(&resp_bytes).ok()?;
+    resp.metadata.id = query_id;
+    let total = resp.answers.len();
+    if qtype == RecordType::A {
+      resp.answers.clear();
+    } else {
+      resp.answers.retain(|rr| rr.record_type() != RecordType::A);
+    }
+    let stripped = total - resp.answers.len();
+    if self.log_enabled {
+      eprintln!("strip_a: {qname} stripped={stripped}");
+    }
+    resp.to_vec().ok()
   }
 }
 
@@ -225,15 +239,10 @@ async fn run(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) 
           ex.spawn({
             let app = app.clone();
             async move {
-              let mut len_buf = [0u8; 2];
-              if stream.read_exact(&mut len_buf).await.is_err() {
-                return;
-              }
-              let query_len = u16::from_be_bytes(len_buf) as usize;
-              let mut query_buf = vec![0u8; query_len];
-              if stream.read_exact(&mut query_buf).await.is_err() {
-                return;
-              }
+              let query_buf = match read_tcp_query_bytes(&mut stream).await {
+                Some(b) => b,
+                None => return,
+              };
 
               let query = match Message::from_vec(&query_buf) {
                 Ok(q) => q,
@@ -263,6 +272,15 @@ async fn run(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) 
   }
 
   pending::<()>().await;
+}
+
+async fn read_tcp_query_bytes(stream: &mut TcpStream) -> Option<Vec<u8>> {
+  let mut len_buf = [0u8; 2];
+  stream.read_exact(&mut len_buf).await.ok()?;
+  let query_len = u16::from_be_bytes(len_buf) as usize;
+  let mut query_buf = vec![0u8; query_len];
+  stream.read_exact(&mut query_buf).await.ok()?;
+  Some(query_buf)
 }
 
 fn main() {
