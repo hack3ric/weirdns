@@ -23,10 +23,11 @@ use crate::dns::Transport;
 struct App {
   config: Config,
   trie: FqdnTrieMap<FQDN, Option<usize>>,
+  log_enabled: bool,
 }
 
 impl App {
-  fn new(config: Config) -> Self {
+  fn new(config: Config, log_enabled: bool) -> Self {
     let mut trie = FqdnTrieMap::with_key_root(FQDN::default(), None);
     for (idx, rule) in config.rules.iter().enumerate() {
       for domain in rule.domains.iter() {
@@ -34,7 +35,7 @@ impl App {
         trie.insert(fqdn, Some(idx));
       }
     }
-    App { config, trie }
+    App { config, trie, log_enabled }
   }
 
   fn select_rule(&self, qname: &Name) -> Option<&Rule> {
@@ -56,7 +57,9 @@ impl App {
       .map(|u| u.domains.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","))
       .unwrap_or_else(|| "default".into());
 
-    eprintln!("query: {src} {qname} {qtype:?} rule={label}");
+    if self.log_enabled {
+      eprintln!("query: {src} {qname} {qtype:?} rule={label}");
+    }
 
     let root = Name::root();
     let (qtype, qname) = query
@@ -74,11 +77,11 @@ impl App {
       && rule.dns64_prefix.is_some()
       && qtype == RecordType::AAAA
     {
-      dns64::handle_dns64(query, rule, addresses, transport).await
+      dns64::handle_dns64(query, rule, addresses, transport, self.log_enabled).await
     } else {
       let query_bytes = query.to_vec().ok()?;
 
-      let resp_bytes = dns::resolve(addresses, &query_bytes, qname, transport).await?;
+      let resp_bytes = dns::resolve(addresses, &query_bytes, qname, transport, self.log_enabled).await?;
 
       if let Some(rule) = rule
         && rule.strip_a
@@ -93,7 +96,9 @@ impl App {
           }
         }
         let stripped = total - resp.answers.len();
-        eprintln!("strip_a: {qname} stripped={stripped}");
+        if self.log_enabled {
+          eprintln!("strip_a: {qname} stripped={stripped}");
+        }
         Some(Either::Left(resp))
       } else {
         Some(Either::Right(resp_bytes))
@@ -101,10 +106,14 @@ impl App {
     };
 
     if let Some(Ok(resp)) = resp.map(|x| x.either(|x| x.to_vec(), Ok)) {
-      eprintln!("response: {src} {qname} len={}", resp.len());
+      if self.log_enabled {
+        eprintln!("response: {src} {qname} len={}", resp.len());
+      }
       Some(resp)
     } else {
-      eprintln!("no upstream response: {src}, {qname}");
+      if self.log_enabled {
+        eprintln!("no upstream response: {src}, {qname}");
+      }
       None
     }
   }
@@ -116,10 +125,14 @@ struct Cli {
   /// path to config file
   #[argh(option, short = 'c')]
   config: String,
+
+  /// enable per-request verbose logging
+  #[argh(switch, short = 'v')]
+  verbose: bool,
 }
 
-async fn run(ex: Rc<LocalExecutor<'static>>, config: Config) {
-  let app = Rc::new(App::new(config));
+async fn run(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) {
+  let app = Rc::new(App::new(config, log_enabled));
 
   for addr in app.config.listen.iter().copied() {
     let socket = Rc::new(UdpSocket::bind(addr).await.unwrap_or_else(|e| {
@@ -240,6 +253,8 @@ fn main() {
     exit(1);
   });
 
+  let log_enabled = config.enable_logging || cli.verbose;
+
   let ex = Rc::new(smol::LocalExecutor::new());
-  smol::block_on(ex.run(run(ex.clone(), config)))
+  smol::block_on(ex.run(run(ex.clone(), config, log_enabled)))
 }

@@ -34,6 +34,8 @@ pub struct Config {
   pub default_upstream: Box<[SocketAddr]>,
   #[serde(rename = "rule")]
   pub rules: Box<[Rule]>,
+  #[serde(default)]
+  pub enable_logging: bool,
 }
 
 #[serde_as]

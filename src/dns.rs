@@ -22,11 +22,12 @@ pub async fn resolve(
   query_bytes: &[u8],
   qname: &Name,
   transport: Transport,
+  log_enabled: bool,
 ) -> Option<Vec<u8>> {
   for addr in addresses.iter().copied() {
     let resp = match transport {
-      Transport::Udp => udp_query(addr, query_bytes, qname).await,
-      Transport::Tcp => tcp_query(addr, query_bytes, qname).await,
+      Transport::Udp => udp_query(addr, query_bytes, qname, log_enabled).await,
+      Transport::Tcp => tcp_query(addr, query_bytes, qname, log_enabled).await,
     };
     if let Some(resp) = resp {
       return Some(resp);
@@ -35,7 +36,7 @@ pub async fn resolve(
   None
 }
 
-async fn udp_query(addr: SocketAddr, query: &[u8], qname: &Name) -> Option<Vec<u8>> {
+async fn udp_query(addr: SocketAddr, query: &[u8], qname: &Name, log_enabled: bool) -> Option<Vec<u8>> {
   let local = if addr.is_ipv4() {
     SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
   } else {
@@ -61,17 +62,19 @@ async fn udp_query(addr: SocketAddr, query: &[u8], qname: &Name) -> Option<Vec<u
   match result {
     Ok(resp) => Some(resp),
     Err(e) => {
-      if e.kind() == io::ErrorKind::TimedOut {
-        eprintln!("upstream timeout: {addr:?}, {qname}");
-      } else {
-        eprintln!("upstream error: {addr:?}, {qname}: {e}");
+      if log_enabled {
+        if e.kind() == io::ErrorKind::TimedOut {
+          eprintln!("upstream timeout: {addr:?}, {qname}");
+        } else {
+          eprintln!("upstream error: {addr:?}, {qname}: {e}");
+        }
       }
       None
     }
   }
 }
 
-async fn tcp_query(addr: SocketAddr, query: &[u8], qname: &Name) -> Option<Vec<u8>> {
+async fn tcp_query(addr: SocketAddr, query: &[u8], qname: &Name, log_enabled: bool) -> Option<Vec<u8>> {
   let connect = async {
     let mut stream = TcpStream::connect(addr).await?;
 
@@ -100,10 +103,12 @@ async fn tcp_query(addr: SocketAddr, query: &[u8], qname: &Name) -> Option<Vec<u
   match result {
     Ok(resp) => Some(resp),
     Err(e) => {
-      if e.kind() == io::ErrorKind::TimedOut {
-        eprintln!("upstream timeout: {addr:?}, {qname}");
-      } else {
-        eprintln!("upstream error: {addr:?}, {qname}: {e}");
+      if log_enabled {
+        if e.kind() == io::ErrorKind::TimedOut {
+          eprintln!("upstream timeout: {addr:?}, {qname}");
+        } else {
+          eprintln!("upstream error: {addr:?}, {qname}: {e}");
+        }
       }
       None
     }

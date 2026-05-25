@@ -6,6 +6,10 @@ listen = ["[::1]:5355", "127.0.0.1:5355"]
 # Can be a single address or an array. Port defaults to 53 if omitted.
 default_upstream = "1.1.1.1"
 
+# Enable per-request verbose logging to stderr.
+# Can also be enabled at runtime with the --verbose/-v CLI flag.
+# enable_logging = true
+
 # Each [[rule]] section matches queries for specific domains.
 # Rules are matched by longest domain suffix (trie lookup).
 

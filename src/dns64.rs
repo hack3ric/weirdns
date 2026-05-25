@@ -13,6 +13,7 @@ pub async fn handle_dns64(
   rule: &Rule,
   upstream: &[SocketAddr],
   transport: Transport,
+  log_enabled: bool,
 ) -> Option<Either<Message, Vec<u8>>> {
   let prefix = rule.dns64_prefix?;
   let root = Name::root();
@@ -20,11 +21,13 @@ pub async fn handle_dns64(
 
   if !rule.dns64_force_synth {
     let aaaa_bytes = query.to_vec().ok()?;
-    let aaaa_resp_bytes = dns::resolve(upstream, &aaaa_bytes, qname, transport).await?;
+    let aaaa_resp_bytes = dns::resolve(upstream, &aaaa_bytes, qname, transport, log_enabled).await?;
     let aaaa_resp = Message::from_vec(&aaaa_resp_bytes).ok()?;
 
     if aaaa_resp.answers.iter().any(|rr| rr.record_type() == RecordType::AAAA) {
-      eprintln!("dns64: {qname} native=AAAA");
+      if log_enabled {
+        eprintln!("dns64: {qname} native=AAAA");
+      }
       return Some(Either::Right(aaaa_resp_bytes));
     }
   }
@@ -37,7 +40,7 @@ pub async fn handle_dns64(
   }
 
   let a_bytes = a_query.to_vec().ok()?;
-  let a_resp_bytes = dns::resolve(upstream, &a_bytes, qname, transport).await?;
+  let a_resp_bytes = dns::resolve(upstream, &a_bytes, qname, transport, log_enabled).await?;
   let a_resp = Message::from_vec(&a_resp_bytes).ok()?;
 
   let mut resp = Message::new(query.id, MessageType::Response, OpCode::Query);
@@ -58,7 +61,9 @@ pub async fn handle_dns64(
     }
   }
 
-  eprintln!("dns64: {qname} synthesized={n}");
+  if log_enabled {
+    eprintln!("dns64: {qname} synthesized={n}");
+  }
   Some(Either::Left(resp))
 }
 
