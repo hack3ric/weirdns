@@ -1570,6 +1570,7 @@ dependencies = [
 name = "weirdns"
 version = "0.1.4"
 dependencies = [
+ "anyhow",
  "argh",
  "either",
  "fqdn",

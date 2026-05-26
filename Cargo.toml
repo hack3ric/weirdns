@@ -26,6 +26,7 @@ either = "1.16.0"
 fqdn = "0.5"
 fqdn-trie = "0.5"
 ipnet = "2"
+anyhow = "1.0.102"
 
 [profile.release]
 opt-level = "z"

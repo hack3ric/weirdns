@@ -3,6 +3,7 @@ mod dns;
 mod dns64;
 mod glob;
 
+use anyhow::Context;
 use either::Either;
 use fqdn::FQDN;
 use fqdn_trie::FqdnTrieMap;
@@ -15,20 +16,19 @@ use smol::io::{AsyncReadExt, AsyncWriteExt};
 use smol::net::{TcpListener, TcpStream, UdpSocket};
 use std::borrow::Cow;
 use std::net::SocketAddr;
-use std::process::exit;
 use std::rc::Rc;
 
-use crate::config::{Config, Rule};
+use crate::config::{Cli, Config, Rule, read_config};
 use crate::dns::Transport;
 use crate::glob::{GlobValue, RuleValue, contains_glob, parse_domain_pattern};
 
-struct App {
+struct Instance {
   config: Config,
   trie: FqdnTrieMap<FQDN, RuleValue>,
   log_enabled: bool,
 }
 
-impl App {
+impl Instance {
   fn new(config: Config, log_enabled: bool) -> Self {
     let mut trie = FqdnTrieMap::with_key_root(FQDN::default(), RuleValue::default());
     for (idx, rule) in config.rules.iter().enumerate() {
@@ -58,7 +58,7 @@ impl App {
         }
       }
     }
-    App { config, trie, log_enabled }
+    Instance { config, trie, log_enabled }
   }
 
   fn select_rule(&self, qname: &Name) -> Option<&Rule> {
@@ -158,29 +158,18 @@ impl App {
   }
 }
 
-/// DNS mangler for custom DNS64 behaviours
-#[derive(argh::FromArgs)]
-struct Cli {
-  /// path to config file
-  #[argh(option, short = 'c')]
-  config: String,
+async fn run_loop(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) -> anyhow::Result<()> {
+  let instance = Rc::new(Instance::new(config, log_enabled));
 
-  /// enable per-request verbose logging
-  #[argh(switch, short = 'v')]
-  verbose: bool,
-}
-
-async fn run(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) {
-  let app = Rc::new(App::new(config, log_enabled));
-
-  for addr in app.config.listen.iter().copied() {
-    let socket = Rc::new(UdpSocket::bind(addr).await.unwrap_or_else(|e| {
-      eprintln!("error binding UDP {addr}: {e}");
-      exit(1);
-    }));
+  for addr in instance.config.listen.iter().copied() {
+    let socket = Rc::new(
+      UdpSocket::bind(addr)
+        .await
+        .with_context(|| format!("error binding UDP {addr}"))?,
+    );
 
     ex.spawn({
-      let app = app.clone();
+      let instance = instance.clone();
       let ex = ex.clone();
       async move {
         let mut buf = [0u8; dns::UDP_MAX_PACKET_SIZE];
@@ -202,10 +191,10 @@ async fn run(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) 
           };
 
           ex.spawn({
-            let app = app.clone();
+            let instance = instance.clone();
             let socket = socket.clone();
             async move {
-              if let Some(resp) = app.handle_query(query, src, Transport::Udp).await {
+              if let Some(resp) = instance.handle_query(query, src, Transport::Udp).await {
                 let _ = socket.send_to(&resp, src).await;
               }
             }
@@ -217,14 +206,15 @@ async fn run(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) 
     .detach();
   }
 
-  for addr in app.config.listen.iter().copied() {
-    let listener = Rc::new(TcpListener::bind(addr).await.unwrap_or_else(|e| {
-      eprintln!("error binding TCP {addr}: {e}");
-      exit(1);
-    }));
+  for addr in instance.config.listen.iter().copied() {
+    let listener = Rc::new(
+      TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("error binding TCP {addr}"))?,
+    );
 
     ex.spawn({
-      let app = app.clone();
+      let instance = instance.clone();
       let ex = ex.clone();
       async move {
         loop {
@@ -237,7 +227,7 @@ async fn run(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) 
           };
 
           ex.spawn({
-            let app = app.clone();
+            let instance = instance.clone();
             async move {
               let query_buf = match read_tcp_query_bytes(&mut stream).await {
                 Some(b) => b,
@@ -252,7 +242,7 @@ async fn run(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) 
                 }
               };
 
-              if let Some(resp) = app.handle_query(query, src, Transport::Tcp).await {
+              if let Some(resp) = instance.handle_query(query, src, Transport::Tcp).await {
                 let resp_len = resp.len() as u16;
                 let _ = stream.write_all(&resp_len.to_be_bytes()).await;
                 let _ = stream.write_all(&resp).await;
@@ -267,11 +257,11 @@ async fn run(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) 
   }
 
   {
-    let addrs_str: Vec<String> = app.config.listen.iter().map(|a| a.to_string()).collect();
+    let addrs_str: Vec<String> = instance.config.listen.iter().map(|a| a.to_string()).collect();
     eprintln!("listening on {}", addrs_str.join(", "));
   }
 
-  pending::<()>().await;
+  pending().await
 }
 
 async fn read_tcp_query_bytes(stream: &mut TcpStream) -> Option<Vec<u8>> {
@@ -283,22 +273,24 @@ async fn read_tcp_query_bytes(stream: &mut TcpStream) -> Option<Vec<u8>> {
   Some(query_buf)
 }
 
-fn main() {
+fn run() -> anyhow::Result<()> {
   let cli: Cli = argh::from_env();
-  let config_path = cli.config;
-  let content = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
-    eprintln!("cannot open {config_path}: {e}");
-    exit(1);
-  });
-  let config: Config = toml::from_str(&content).unwrap_or_else(|e| {
-    eprintln!("parse error in {config_path}: {e}");
-    exit(1);
-  });
 
-  let log_enabled = config.enable_logging || cli.verbose;
+  let config = read_config(&cli)?.into_iter().next().unwrap();
+  let log_enabled = config.enable_logging;
 
   let ex = Rc::new(smol::LocalExecutor::new());
-  smol::block_on(ex.run(run(ex.clone(), config, log_enabled)))
+  smol::block_on(ex.run(run_loop(ex.clone(), config, log_enabled)))
+}
+
+fn main() {
+  if let Err(error) = run() {
+    eprintln!(
+      "{}",
+      error.chain().map(ToString::to_string).collect::<Vec<_>>().join(": ")
+    );
+    std::process::exit(1);
+  }
 }
 
 #[cfg(test)]
@@ -337,41 +329,45 @@ mod tests {
   #[test]
   fn integration_exact_match() {
     let rules = vec![make_rule(&["example.com"]), make_rule(&["other.com"])];
-    let app = App::new(make_config(rules), false);
-    assert!(app.select_rule(&name("example.com")).is_some());
-    assert!(app.select_rule(&name("sub.example.com")).is_some());
-    assert!(app.select_rule(&name("other.com")).is_some());
-    assert!(app.select_rule(&name("unmatched.com")).is_none());
+    let instance = Instance::new(make_config(rules), false);
+    assert!(instance.select_rule(&name("example.com")).is_some());
+    assert!(instance.select_rule(&name("sub.example.com")).is_some());
+    assert!(instance.select_rule(&name("other.com")).is_some());
+    assert!(instance.select_rule(&name("unmatched.com")).is_none());
   }
 
   #[test]
   fn integration_glob_single_wildcard_label() {
     let rules = vec![make_rule(&["*.example.com"])];
-    let app = App::new(make_config(rules), false);
-    assert!(app.select_rule(&name("foo.example.com")).is_some());
-    assert!(app.select_rule(&name("bar.example.com")).is_some());
-    assert!(app.select_rule(&name("sub.foo.example.com")).is_some());
-    assert!(app.select_rule(&name("foo.other.com")).is_none());
+    let instance = Instance::new(make_config(rules), false);
+    assert!(instance.select_rule(&name("foo.example.com")).is_some());
+    assert!(instance.select_rule(&name("bar.example.com")).is_some());
+    assert!(instance.select_rule(&name("sub.foo.example.com")).is_some());
+    assert!(instance.select_rule(&name("foo.other.com")).is_none());
   }
 
   #[test]
   fn integration_glob_within_label() {
     let rules = vec![make_rule(&["chatgpt-async-webps-prod-*-*.webpubsub.azure.com"])];
-    let app = App::new(make_config(rules), false);
+    let instance = Instance::new(make_config(rules), false);
     assert!(
-      app
+      instance
         .select_rule(&name("chatgpt-async-webps-prod-someid-123.webpubsub.azure.com"))
         .is_some()
     );
     assert!(
-      app
+      instance
         .select_rule(&name("chatgpt-async-webps-prod-abc-42.webpubsub.azure.com"))
         .is_some()
     );
-    assert!(!app.select_rule(&name("other-prod-someid-123.webpubsub.azure.com")).is_some());
+    assert!(
+      !instance
+        .select_rule(&name("other-prod-someid-123.webpubsub.azure.com"))
+        .is_some()
+    );
     // subdomain: should match
     assert!(
-      app
+      instance
         .select_rule(&name("x.chatgpt-async-webps-prod-someid-123.webpubsub.azure.com"))
         .is_some()
     );
@@ -380,26 +376,26 @@ mod tests {
   #[test]
   fn integration_exact_priority_over_glob() {
     let rules = vec![make_rule(&["*.example.com"]), make_rule(&["exact.example.com"])];
-    let app = App::new(make_config(rules), false);
-    let r = app.select_rule(&name("exact.example.com")).unwrap();
+    let instance = Instance::new(make_config(rules), false);
+    let r = instance.select_rule(&name("exact.example.com")).unwrap();
     assert_eq!(r.domains.join(","), "exact.example.com");
   }
 
   #[test]
   fn integration_question_mark() {
     let rules = vec![make_rule(&["app-?.example.com"])];
-    let app = App::new(make_config(rules), false);
-    assert!(app.select_rule(&name("app-1.example.com")).is_some());
-    assert!(app.select_rule(&name("app-x.example.com")).is_some());
-    assert!(!app.select_rule(&name("app-12.example.com")).is_some());
+    let instance = Instance::new(make_config(rules), false);
+    assert!(instance.select_rule(&name("app-1.example.com")).is_some());
+    assert!(instance.select_rule(&name("app-x.example.com")).is_some());
+    assert!(!instance.select_rule(&name("app-12.example.com")).is_some());
   }
 
   #[test]
   fn integration_glob_at_root_match_any() {
     let rules = vec![make_rule(&["*"])];
-    let app = App::new(make_config(rules), false);
-    assert!(app.select_rule(&name("example.com")).is_some());
-    assert!(app.select_rule(&name("foo.bar.example.com")).is_some());
-    assert!(app.select_rule(&name("com")).is_some());
+    let instance = Instance::new(make_config(rules), false);
+    assert!(instance.select_rule(&name("example.com")).is_some());
+    assert!(instance.select_rule(&name("foo.bar.example.com")).is_some());
+    assert!(instance.select_rule(&name("com")).is_some());
   }
 }

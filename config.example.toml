@@ -40,3 +40,10 @@ upstream = ["223.5.5.5", "223.6.6.6"]
 # [[rule]]
 # domains = "."
 # dns64_prefix = "64:ff9b:abcd::"
+
+# Additional instances can be imported from other files.
+# Each imported file uses the same flat structure as this file:
+# one local instance body plus optional nested [[instance]] imports.
+# [[instance]]
+# name = "lab"
+# import = "instances/lab.toml"
