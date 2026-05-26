@@ -2,6 +2,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde_with::{DeserializeAs, OneOrMany, serde_as};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 const DNS_PORT: u16 = 53;
 
@@ -30,7 +31,7 @@ impl<'de, const PORT: u16> DeserializeAs<'de, SocketAddr> for Addr<PORT> {
 pub struct Cli {
   /// path to config file
   #[argh(option, short = 'c')]
-  config: String,
+  config: PathBuf,
 
   /// enable per-request verbose logging
   #[argh(switch, short = 'v')]
@@ -69,38 +70,90 @@ struct ConfigFile {
   #[serde(flatten)]
   config: Option<Config>,
   #[serde(rename = "instance", default)]
-  instances: Box<[InstanceRef]>,
+  instances: Vec<InstanceRef>,
 }
 
 #[derive(Deserialize)]
 struct InstanceRef {
-  include: Box<str>,
+  include: PathBuf,
 }
 
 pub fn read_config(cli: &Cli) -> anyhow::Result<Vec<Config>> {
   let mut configs = Vec::new();
-  read_config_inner(&cli, cli.config.clone().into(), &mut Vec::new(), &mut configs)?;
+  read_config_inner(cli, cli.config.clone(), &mut Vec::new(), &mut configs)?;
   Ok(configs)
 }
 
 fn read_config_inner(
   cli: &Cli,
-  path: Box<str>,
-  visited: &mut Vec<Box<str>>,
+  path: PathBuf,
+  visited: &mut Vec<PathBuf>,
   configs: &mut Vec<Config>,
 ) -> anyhow::Result<()> {
   if visited.contains(&path) {
     return Ok(());
   }
-  let content = std::fs::read_to_string(&*path).with_context(|| format!("cannot open {path}"))?;
-  let config_file: ConfigFile = toml::from_str(&content).with_context(|| format!("parse error in {path}"))?;
+
+  let display_path = path.display();
+  let content = std::fs::read_to_string(&path).with_context(|| format!("cannot open {display_path}"))?;
+  let config_file: ConfigFile = toml::from_str(&content).with_context(|| format!("parse error in {display_path}"))?;
   if let Some(mut config) = config_file.config {
     config.enable_logging |= cli.verbose;
     configs.push(config);
   }
+
+  let include_base = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
   visited.push(path);
   for instance_ref in config_file.instances {
-    read_config_inner(cli, instance_ref.include, visited, configs)?;
+    let include = Path::new(&*instance_ref.include);
+    let include_path = if include.is_absolute() {
+      include.to_path_buf()
+    } else {
+      include_base.join(include)
+    };
+    read_config_inner(cli, include_path, visited, configs)?;
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::fs;
+  use std::time::{SystemTime, UNIX_EPOCH};
+
+  fn make_cli(config: impl Into<PathBuf>) -> Cli {
+    Cli { config: config.into(), verbose: false }
+  }
+
+  #[test]
+  fn resolves_instance_includes_relative_to_parent_config() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("weirdns-config-test-{unique}"));
+    let nested = root.join("instances");
+    fs::create_dir_all(&nested).unwrap();
+
+    let main = root.join("main.toml");
+    let child = nested.join("child.toml");
+
+    fs::write(
+      &main,
+      concat!(
+        "listen = \"127.0.0.1:5300\"\n",
+        "default_upstream = \"1.1.1.1\"\n",
+        "\n",
+        "[[instance]]\n",
+        "include = \"instances/child.toml\"\n",
+      ),
+    )
+    .unwrap();
+    fs::write(&child, "listen = \"127.0.0.1:5301\"\ndefault_upstream = \"1.0.0.1\"\n").unwrap();
+
+    let configs = read_config(&make_cli(main.display().to_string())).unwrap();
+    assert_eq!(configs.len(), 2);
+    assert_eq!(configs[0].listen[0], "127.0.0.1:5300".parse().unwrap());
+    assert_eq!(configs[1].listen[0], "127.0.0.1:5301".parse().unwrap());
+
+    fs::remove_dir_all(root).unwrap();
+  }
 }
