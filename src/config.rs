@@ -78,9 +78,8 @@ struct InstanceRef {
 }
 
 pub fn read_config(cli: &Cli) -> anyhow::Result<Vec<Config>> {
-  let mut visited = Vec::new();
   let mut configs = Vec::new();
-  read_config_inner(&cli, cli.config.clone().into(), &mut visited, &mut configs)?;
+  read_config_inner(&cli, cli.config.clone().into(), &mut Vec::new(), &mut configs)?;
   Ok(configs)
 }
 

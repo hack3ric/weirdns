@@ -45,5 +45,4 @@ upstream = ["223.5.5.5", "223.6.6.6"]
 # Each imported file uses the same flat structure as this file:
 # one local instance body plus optional nested [[instance]] imports.
 # [[instance]]
-# name = "lab"
-# import = "instances/lab.toml"
+# include = "instances/lab.toml"

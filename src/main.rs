@@ -158,7 +158,11 @@ impl Instance {
   }
 }
 
-async fn run_loop(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) -> anyhow::Result<()> {
+async fn start_instance(
+  ex: Rc<LocalExecutor<'static>>,
+  config: Config,
+  log_enabled: bool,
+) -> anyhow::Result<()> {
   let instance = Rc::new(Instance::new(config, log_enabled));
 
   for addr in instance.config.listen.iter().copied() {
@@ -261,7 +265,7 @@ async fn run_loop(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: b
     eprintln!("listening on {}", addrs_str.join(", "));
   }
 
-  pending().await
+  Ok(())
 }
 
 async fn read_tcp_query_bytes(stream: &mut TcpStream) -> Option<Vec<u8>> {
@@ -275,12 +279,17 @@ async fn read_tcp_query_bytes(stream: &mut TcpStream) -> Option<Vec<u8>> {
 
 fn run() -> anyhow::Result<()> {
   let cli: Cli = argh::from_env();
-
-  let config = read_config(&cli)?.into_iter().next().unwrap();
-  let log_enabled = config.enable_logging;
+  let configs = read_config(&cli)?;
 
   let ex = Rc::new(smol::LocalExecutor::new());
-  smol::block_on(ex.run(run_loop(ex.clone(), config, log_enabled)))
+  let run_ex = ex.clone();
+  smol::block_on(ex.run(async move {
+    for config in configs {
+      let log_enabled = config.enable_logging;
+      start_instance(run_ex.clone(), config, log_enabled).await?;
+    }
+    pending().await
+  }))
 }
 
 fn main() {
