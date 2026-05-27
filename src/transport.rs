@@ -1,13 +1,12 @@
-use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
-
 use anyhow::Context;
 use async_io::Timer;
 use async_net::{TcpStream, UdpSocket};
 use futures_lite::FutureExt;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
-use hickory_proto::rr::Name;
+use simple_dns::Name;
+use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 pub const UDP_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TCP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -22,7 +21,7 @@ pub enum Transport {
 pub async fn resolve(
   addresses: &[SocketAddr],
   query_bytes: &[u8],
-  qname: &Name,
+  qname: &Name<'_>,
   transport: Transport,
 ) -> anyhow::Result<Vec<u8>> {
   let mut resp = Err(anyhow::Error::msg("addresses empty??"));
@@ -38,7 +37,7 @@ pub async fn resolve(
   resp
 }
 
-async fn udp_query(addr: SocketAddr, query: &[u8], qname: &Name) -> anyhow::Result<Vec<u8>> {
+async fn udp_query(addr: SocketAddr, query: &[u8], qname: &Name<'_>) -> anyhow::Result<Vec<u8>> {
   let local = if addr.is_ipv4() {
     SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)
   } else {
@@ -63,7 +62,7 @@ async fn udp_query(addr: SocketAddr, query: &[u8], qname: &Name) -> anyhow::Resu
     .with_context(|| format!("upstream error: {addr:?}, {qname}"))
 }
 
-async fn tcp_query(addr: SocketAddr, query: &[u8], qname: &Name) -> anyhow::Result<Vec<u8>> {
+async fn tcp_query(addr: SocketAddr, query: &[u8], qname: &Name<'_>) -> anyhow::Result<Vec<u8>> {
   let connect = async {
     let mut stream = TcpStream::connect(addr).await?;
 

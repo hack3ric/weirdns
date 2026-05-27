@@ -1,13 +1,10 @@
 use anyhow::Context;
 use async_executor::LocalExecutor;
 use async_net::{TcpListener, TcpStream, UdpSocket};
-use either::Either;
 use fqdn::FQDN;
 use fqdn_trie::FqdnTrieMap;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
-use hickory_proto::op::Message;
-use hickory_proto::rr::{Name, RecordType};
-use hickory_proto::serialize::binary::BinEncodable;
+use simple_dns::{Name, Packet, QTYPE, TYPE};
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -55,7 +52,7 @@ impl Instance {
   }
 
   fn select_rule(&self, qname: &Name) -> Option<&Rule> {
-    let fqdn = qname.to_bytes().ok().and_then(|b| FQDN::try_from(b).ok())?;
+    let fqdn = FQDN::from_ascii_str(&qname.to_string()).ok()?;
     let (suffix, value) = self.trie.lookup_key_value(&fqdn);
     if let Some(idx) = value.exact {
       return Some(&self.config.rules[idx]);
@@ -68,12 +65,12 @@ impl Instance {
     None
   }
 
-  async fn handle_query(&self, query: Message, src: SocketAddr, transport: Transport) -> anyhow::Result<Vec<u8>> {
+  async fn handle_query(&self, query: Packet<'_>, src: SocketAddr, transport: Transport) -> anyhow::Result<Vec<u8>> {
     let (qtype, qname) = query
-      .queries
+      .questions
       .first()
-      .map(|q| (q.query_type(), q.name().clone()))
-      .unwrap_or_else(|| (RecordType::A, Name::root()));
+      .map(|q| (question_type(q.qtype), q.qname.clone()))
+      .unwrap_or_else(|| (TYPE::A, Name::new_unchecked("")));
 
     let rule = self.select_rule(&qname);
 
@@ -97,31 +94,25 @@ impl Instance {
 
   async fn resolve_query(
     &self,
-    query: Message,
-    qname: &Name,
-    qtype: RecordType,
+    query: Packet<'_>,
+    qname: &Name<'_>,
+    qtype: TYPE,
     rule: Option<&Rule>,
     addresses: &[SocketAddr],
     transport: Transport,
   ) -> anyhow::Result<Vec<u8>> {
     match (rule, qtype) {
-      (Some(rule), RecordType::AAAA) if rule.dns64_prefix.is_some() => {
-        match dns64::handle_dns64(query, rule, addresses, transport, self.config.log).await? {
-          Either::Left(msg) => Ok(msg.to_vec()?),
-          Either::Right(bytes) => Ok(bytes),
-        }
+      (Some(rule), TYPE::AAAA) if rule.dns64_prefix.is_some() => {
+        dns64::handle_dns64(query, rule, addresses, transport, self.config.log).await
       }
-      (Some(rule), RecordType::PTR) if rule.dns64_prefix.is_some() => {
-        match dns64::handle_dns64_rdns(query, rule, addresses, transport, self.config.log).await? {
-          Either::Left(msg) => Ok(msg.to_vec()?),
-          Either::Right(bytes) => Ok(bytes),
-        }
+      (Some(rule), TYPE::PTR) if rule.dns64_prefix.is_some() => {
+        dns64::handle_dns64_rdns(query, rule, addresses, transport, self.config.log).await
       }
       _ => {
-        let query_bytes = query.to_vec()?;
+        let query_bytes = query.build_bytes_vec_compressed()?;
         let resp_bytes = transport::resolve(addresses, &query_bytes, qname, transport).await?;
         match rule {
-          Some(rule) if rule.strip_a => self.apply_strip_a(qname, query.id, qtype, resp_bytes),
+          Some(rule) if rule.strip_a => self.apply_strip_a(qname, query.id(), qtype, resp_bytes),
           _ => Ok(resp_bytes),
         }
       }
@@ -132,22 +123,22 @@ impl Instance {
     &self,
     qname: &Name,
     query_id: u16,
-    qtype: RecordType,
+    qtype: TYPE,
     resp_bytes: Vec<u8>,
   ) -> anyhow::Result<Vec<u8>> {
-    let mut resp = Message::from_vec(&resp_bytes)?;
-    resp.metadata.id = query_id;
+    let mut resp = Packet::parse(&resp_bytes)?;
+    resp.set_id(query_id);
     let total = resp.answers.len();
-    if qtype == RecordType::A {
+    if qtype == TYPE::A {
       resp.answers.clear();
     } else {
-      resp.answers.retain(|rr| rr.record_type() != RecordType::A);
+      resp.answers.retain(|rr| rr.rdata.type_code() != TYPE::A);
     }
     let stripped = total - resp.answers.len();
     if self.config.log {
       eprintln!("strip_a: {qname} stripped={stripped}");
     }
-    Ok(resp.to_vec()?)
+    Ok(resp.build_bytes_vec_compressed()?)
   }
 }
 
@@ -186,11 +177,12 @@ async fn spawn_udp_listener(
       loop {
         let _ = print_anyhow_result_async(async {
           let (n, src) = socket.recv_from(&mut buf).await.context("recvfrom")?;
-          let query = parse_query_bytes(&buf[..n], src, "query")?;
+          let query_bytes = buf[..n].to_vec();
           ex.spawn(print_anyhow_result_async({
             let instance = instance.clone();
             let socket = socket.clone();
             async move {
+              let query = parse_query_bytes(&query_bytes, src, "query")?;
               let resp = instance.handle_query(query, src, Transport::Udp).await?;
               socket.send_to(&resp, src).await?;
               anyhow::Ok(())
@@ -262,12 +254,19 @@ async fn read_tcp_query_bytes(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>>
   Ok(query_buf)
 }
 
-fn parse_query_bytes(buf: &[u8], src: SocketAddr, label: &str) -> anyhow::Result<Message> {
-  Message::from_vec(buf).with_context(|| format!("failed to parse {label} from {src}"))
+fn parse_query_bytes<'a>(buf: &'a [u8], src: SocketAddr, label: &str) -> anyhow::Result<Packet<'a>> {
+  Packet::parse(buf).with_context(|| format!("failed to parse {label} from {src}"))
 }
 
 async fn print_anyhow_result_async<T>(f: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
   f.await.inspect_err(print_anyhow_error)
+}
+
+fn question_type(qtype: QTYPE) -> TYPE {
+  match qtype {
+    QTYPE::TYPE(ty) => ty,
+    _ => TYPE::Unknown(u16::from(qtype)),
+  }
 }
 
 #[cfg(test)]
@@ -297,9 +296,8 @@ mod tests {
     }
   }
 
-  fn name(s: &str) -> Name {
-    let fqdn_str = if s.ends_with('.') { s.into() } else { format!("{s}.") };
-    Name::from_ascii(&fqdn_str).unwrap()
+  fn name(s: &str) -> Name<'_> {
+    Name::new(s.trim_end_matches('.')).unwrap()
   }
 
   #[test]
