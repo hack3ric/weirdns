@@ -3,10 +3,11 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::Context;
+use async_io::Timer;
+use async_net::{TcpStream, UdpSocket};
+use futures_lite::FutureExt;
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use hickory_proto::rr::Name;
-use smol::future::FutureExt;
-use smol::io::{AsyncReadExt, AsyncWriteExt};
-use smol::net::{TcpStream, UdpSocket};
 
 pub const UDP_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TCP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -55,7 +56,7 @@ async fn udp_query(addr: SocketAddr, query: &[u8], qname: &Name) -> anyhow::Resu
 
   send_recv
     .or(async {
-      smol::Timer::after(UDP_TIMEOUT).await;
+      Timer::after(UDP_TIMEOUT).await;
       Err(io::Error::new(io::ErrorKind::TimedOut, "timeout"))
     })
     .await
@@ -81,7 +82,7 @@ async fn tcp_query(addr: SocketAddr, query: &[u8], qname: &Name) -> anyhow::Resu
 
   connect
     .or(async {
-      smol::Timer::after(TCP_TIMEOUT).await;
+      Timer::after(TCP_TIMEOUT).await;
       Err(io::Error::new(io::ErrorKind::TimedOut, "timeout").into())
     })
     .await

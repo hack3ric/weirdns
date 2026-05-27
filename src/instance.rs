@@ -1,13 +1,13 @@
 use anyhow::Context;
+use async_executor::LocalExecutor;
+use async_net::{TcpListener, TcpStream, UdpSocket};
 use either::Either;
 use fqdn::FQDN;
 use fqdn_trie::FqdnTrieMap;
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use hickory_proto::op::Message;
 use hickory_proto::rr::{Name, RecordType};
 use hickory_proto::serialize::binary::BinEncodable;
-use smol::LocalExecutor;
-use smol::io::{AsyncReadExt, AsyncWriteExt};
-use smol::net::{TcpListener, TcpStream, UdpSocket};
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::rc::Rc;

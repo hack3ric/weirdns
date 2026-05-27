@@ -4,7 +4,8 @@ mod glob;
 mod instance;
 mod transport;
 
-use smol::future::pending;
+use async_executor::LocalExecutor;
+use futures_lite::future::block_on;
 use std::rc::Rc;
 
 use crate::config::{Cli, read_config};
@@ -14,14 +15,14 @@ fn run() -> anyhow::Result<()> {
   let cli: Cli = argh::from_env();
   let configs = read_config(&cli)?;
 
-  let ex = Rc::new(smol::LocalExecutor::new());
-  smol::block_on(ex.run({
+  let ex = Rc::new(LocalExecutor::new());
+  block_on(ex.run({
     let ex = ex.clone();
     async move {
       for config in configs {
         start_instance(ex.clone(), config).await?;
       }
-      pending().await
+      std::future::pending().await
     }
   }))
 }

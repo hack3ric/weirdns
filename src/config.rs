@@ -1,29 +1,88 @@
 use anyhow::Context;
 use serde::Deserialize;
-use serde_with::{DeserializeAs, OneOrMany, serde_as};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 const DNS_PORT: u16 = 53;
 
-enum Addr<const PORT: u16> {}
-
-impl<'de, const PORT: u16> DeserializeAs<'de, SocketAddr> for Addr<PORT> {
-  fn deserialize_as<D>(d: D) -> Result<SocketAddr, D::Error>
-  where
-    D: serde::Deserializer<'de>,
-  {
-    let s = Box::<str>::deserialize(d)?;
-    if let Ok(addr) = s.parse::<SocketAddr>() {
-      return Ok(addr);
-    }
-    match s.parse::<IpAddr>() {
-      Ok(ip) => Ok(SocketAddr::new(ip, PORT)),
-      Err(_) => Err(serde::de::Error::custom(format!(
-        "expected IP or socket address, got: {s}"
-      ))),
-    }
+fn parse_addr(s: &str) -> Result<SocketAddr, String> {
+  if let Ok(addr) = s.parse::<SocketAddr>() {
+    return Ok(addr);
   }
+  match s.parse::<IpAddr>() {
+    Ok(ip) => Ok(SocketAddr::new(ip, DNS_PORT)),
+    Err(_) => Err(format!("expected IP or socket address, got: {s}")),
+  }
+}
+
+fn deserialize_one_or_many<'de, D, T>(d: D) -> Result<Box<[T]>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+  T: Deserialize<'de>,
+{
+  #[derive(Deserialize)]
+  #[serde(untagged)]
+  enum OneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+  }
+
+  match OneOrMany::deserialize(d)? {
+    OneOrMany::One(value) => Ok(vec![value].into_boxed_slice()),
+    OneOrMany::Many(values) => Ok(values.into_boxed_slice()),
+  }
+}
+
+fn deserialize_socket_addr<'de, D>(d: D) -> Result<SocketAddr, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  let s = Box::<str>::deserialize(d)?;
+  parse_addr(&s).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_socket_addrs<'de, D>(d: D) -> Result<Box<[SocketAddr]>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  #[derive(Deserialize)]
+  #[serde(transparent)]
+  struct Addr(#[serde(deserialize_with = "deserialize_socket_addr")] SocketAddr);
+
+  deserialize_one_or_many::<D, Addr>(d).map(|values| {
+    values
+      .into_vec()
+      .into_iter()
+      .map(|Addr(addr)| addr)
+      .collect::<Vec<_>>()
+      .into_boxed_slice()
+  })
+}
+
+fn deserialize_optional_socket_addrs<'de, D>(d: D) -> Result<Option<Box<[SocketAddr]>>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+{
+  #[derive(Deserialize)]
+  #[serde(untagged)]
+  enum OptionalOneOrMany<T> {
+    One(T),
+    Many(Vec<T>),
+  }
+
+  Option::<OptionalOneOrMany<Box<str>>>::deserialize(d)?
+    .map(|values| match values {
+      OptionalOneOrMany::One(value) => vec![value],
+      OptionalOneOrMany::Many(values) => values,
+    })
+    .map(|values| {
+      values
+        .into_iter()
+        .map(|value| parse_addr(&value).map_err(serde::de::Error::custom))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
+    })
+    .transpose()
 }
 
 /// DNS mangler for custom DNS64 behaviours
@@ -38,12 +97,11 @@ pub struct Cli {
   verbose: bool,
 }
 
-#[serde_as]
 #[derive(Deserialize)]
 pub struct Config {
-  #[serde_as(as = "OneOrMany<Addr<DNS_PORT>>")]
+  #[serde(deserialize_with = "deserialize_socket_addrs")]
   pub listen: Box<[SocketAddr]>,
-  #[serde_as(as = "OneOrMany<Addr<DNS_PORT>>")]
+  #[serde(deserialize_with = "deserialize_socket_addrs")]
   pub default_upstream: Box<[SocketAddr]>,
   #[serde(rename = "rule", default)]
   pub rules: Box<[Rule]>,
@@ -51,12 +109,11 @@ pub struct Config {
   pub log: bool,
 }
 
-#[serde_as]
 #[derive(Deserialize)]
 pub struct Rule {
-  #[serde_as(as = "OneOrMany<_>")]
+  #[serde(deserialize_with = "deserialize_one_or_many")]
   pub domains: Box<[Box<str>]>,
-  #[serde_as(as = "Option<OneOrMany<Addr<DNS_PORT>>>")]
+  #[serde(default, deserialize_with = "deserialize_optional_socket_addrs")]
   pub upstream: Option<Box<[SocketAddr]>>,
   pub dns64_prefix: Option<Ipv6Addr>,
   #[serde(default)]
@@ -155,5 +212,24 @@ mod tests {
     assert_eq!(configs[1].listen[0], "127.0.0.1:5301".parse().unwrap());
 
     fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn deserializes_single_upstream_value() {
+    let config: Config = toml::from_str(
+      concat!(
+        "listen = \"127.0.0.1\"\n",
+        "default_upstream = \"1.1.1.1\"\n",
+        "\n",
+        "[[rule]]\n",
+        "domains = \"example.com\"\n",
+        "upstream = \"8.8.8.8\"\n",
+      ),
+    )
+    .unwrap();
+
+    assert_eq!(config.listen[0], "127.0.0.1:53".parse().unwrap());
+    assert_eq!(config.default_upstream[0], "1.1.1.1:53".parse().unwrap());
+    assert_eq!(config.rules[0].upstream.as_ref().unwrap()[0], "8.8.8.8:53".parse().unwrap());
   }
 }
