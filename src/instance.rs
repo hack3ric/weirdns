@@ -20,11 +20,10 @@ use crate::{dns64, print_anyhow_error};
 pub struct Instance {
   config: Config,
   trie: FqdnTrieMap<FQDN, RuleValue>,
-  log_enabled: bool,
 }
 
 impl Instance {
-  pub fn new(config: Config, log_enabled: bool) -> Self {
+  pub fn new(config: Config) -> Self {
     let mut trie = FqdnTrieMap::with_key_root(FQDN::default(), RuleValue::default());
     for (idx, rule) in config.rules.iter().enumerate() {
       for domain in rule.domains.iter() {
@@ -52,7 +51,7 @@ impl Instance {
         }
       }
     }
-    Instance { config, trie, log_enabled }
+    Instance { config, trie }
   }
 
   fn select_rule(&self, qname: &Name) -> Option<&Rule> {
@@ -78,7 +77,7 @@ impl Instance {
 
     let rule = self.select_rule(&qname);
 
-    if self.log_enabled {
+    if self.config.log {
       let label: Cow<'static, str> = rule.map(|u| u.domains.join(",").into()).unwrap_or_else(|| "default".into());
       eprintln!("query: {src} {qname} {qtype:?} rule={label}");
     }
@@ -89,7 +88,7 @@ impl Instance {
 
     let resp = self.resolve_query(query, &qname, qtype, rule, addresses, transport).await;
     if let Ok(resp) = &resp
-      && self.log_enabled
+      && self.config.log
     {
       eprintln!("response: {src} {qname} len={}", resp.len());
     }
@@ -107,13 +106,13 @@ impl Instance {
   ) -> anyhow::Result<Vec<u8>> {
     match (rule, qtype) {
       (Some(rule), RecordType::AAAA) if rule.dns64_prefix.is_some() => {
-        match dns64::handle_dns64(query, rule, addresses, transport, self.log_enabled).await? {
+        match dns64::handle_dns64(query, rule, addresses, transport, self.config.log).await? {
           Either::Left(msg) => Ok(msg.to_vec()?),
           Either::Right(bytes) => Ok(bytes),
         }
       }
       (Some(rule), RecordType::PTR) if rule.dns64_prefix.is_some() => {
-        match dns64::handle_dns64_rdns(query, rule, addresses, transport, self.log_enabled).await? {
+        match dns64::handle_dns64_rdns(query, rule, addresses, transport, self.config.log).await? {
           Either::Left(msg) => Ok(msg.to_vec()?),
           Either::Right(bytes) => Ok(bytes),
         }
@@ -145,23 +144,26 @@ impl Instance {
       resp.answers.retain(|rr| rr.record_type() != RecordType::A);
     }
     let stripped = total - resp.answers.len();
-    if self.log_enabled {
+    if self.config.log {
       eprintln!("strip_a: {qname} stripped={stripped}");
     }
     Ok(resp.to_vec()?)
   }
 }
 
-pub async fn start_instance(ex: Rc<LocalExecutor<'static>>, config: Config, log_enabled: bool) -> anyhow::Result<()> {
-  let instance = Rc::new(Instance::new(config, log_enabled));
+pub async fn start_instance(ex: Rc<LocalExecutor<'static>>, config: Config) -> anyhow::Result<()> {
+  let instance = Rc::new(Instance::new(config));
 
   for addr in instance.config.listen.iter().copied() {
     spawn_udp_listener(ex.clone(), instance.clone(), addr).await?;
     spawn_tcp_listener(ex.clone(), instance.clone(), addr).await?;
   }
 
-  let addrs_str: Vec<String> = instance.config.listen.iter().map(|a| a.to_string()).collect();
-  eprintln!("listening on {}", addrs_str.join(", "));
+  let addrs_str = (instance.config.listen.iter())
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join(", ");
+  eprintln!("listening on {addrs_str}");
   Ok(())
 }
 
@@ -277,7 +279,7 @@ mod tests {
       listen: Box::new([]),
       default_upstream: Box::new([]),
       rules: rules.into_boxed_slice(),
-      enable_logging: false,
+      log: false,
     }
   }
 
@@ -303,7 +305,7 @@ mod tests {
   #[test]
   fn integration_exact_match() {
     let rules = vec![make_rule(&["example.com"]), make_rule(&["other.com"])];
-    let instance = Instance::new(make_config(rules), false);
+    let instance = Instance::new(make_config(rules));
     assert!(instance.select_rule(&name("example.com")).is_some());
     assert!(instance.select_rule(&name("sub.example.com")).is_some());
     assert!(instance.select_rule(&name("other.com")).is_some());
@@ -313,7 +315,7 @@ mod tests {
   #[test]
   fn integration_glob_single_wildcard_label() {
     let rules = vec![make_rule(&["*.example.com"])];
-    let instance = Instance::new(make_config(rules), false);
+    let instance = Instance::new(make_config(rules));
     assert!(instance.select_rule(&name("foo.example.com")).is_some());
     assert!(instance.select_rule(&name("bar.example.com")).is_some());
     assert!(instance.select_rule(&name("sub.foo.example.com")).is_some());
@@ -323,7 +325,7 @@ mod tests {
   #[test]
   fn integration_glob_within_label() {
     let rules = vec![make_rule(&["chatgpt-async-webps-prod-*-*.webpubsub.azure.com"])];
-    let instance = Instance::new(make_config(rules), false);
+    let instance = Instance::new(make_config(rules));
     assert!(
       instance
         .select_rule(&name("chatgpt-async-webps-prod-someid-123.webpubsub.azure.com"))
@@ -349,7 +351,7 @@ mod tests {
   #[test]
   fn integration_exact_priority_over_glob() {
     let rules = vec![make_rule(&["*.example.com"]), make_rule(&["exact.example.com"])];
-    let instance = Instance::new(make_config(rules), false);
+    let instance = Instance::new(make_config(rules));
     let r = instance.select_rule(&name("exact.example.com")).unwrap();
     assert_eq!(r.domains.join(","), "exact.example.com");
   }
@@ -357,7 +359,7 @@ mod tests {
   #[test]
   fn integration_question_mark() {
     let rules = vec![make_rule(&["app-?.example.com"])];
-    let instance = Instance::new(make_config(rules), false);
+    let instance = Instance::new(make_config(rules));
     assert!(instance.select_rule(&name("app-1.example.com")).is_some());
     assert!(instance.select_rule(&name("app-x.example.com")).is_some());
     assert!(instance.select_rule(&name("app-12.example.com")).is_none());
@@ -366,7 +368,7 @@ mod tests {
   #[test]
   fn integration_glob_at_root_match_any() {
     let rules = vec![make_rule(&["*"])];
-    let instance = Instance::new(make_config(rules), false);
+    let instance = Instance::new(make_config(rules));
     assert!(instance.select_rule(&name("example.com")).is_some());
     assert!(instance.select_rule(&name("foo.bar.example.com")).is_some());
     assert!(instance.select_rule(&name("com")).is_some());

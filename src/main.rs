@@ -19,8 +19,7 @@ fn run() -> anyhow::Result<()> {
     let ex = ex.clone();
     async move {
       for config in configs {
-        let log_enabled = config.enable_logging;
-        start_instance(ex.clone(), config, log_enabled).await?;
+        start_instance(ex.clone(), config).await?;
       }
       pending().await
     }

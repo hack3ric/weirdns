@@ -48,7 +48,7 @@ pub struct Config {
   #[serde(rename = "rule", default)]
   pub rules: Box<[Rule]>,
   #[serde(default)]
-  pub enable_logging: bool,
+  pub log: bool,
 }
 
 #[serde_as]
@@ -98,7 +98,7 @@ fn read_config_inner(
   let content = std::fs::read_to_string(&path).with_context(|| format!("cannot open {display_path}"))?;
   let config_file: ConfigFile = toml::from_str(&content).with_context(|| format!("parse error in {display_path}"))?;
   if let Some(mut config) = config_file.config {
-    config.enable_logging |= cli.verbose;
+    config.log |= cli.verbose;
     configs.push(config);
   }
 
