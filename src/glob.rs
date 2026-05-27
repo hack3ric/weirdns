@@ -48,7 +48,7 @@ pub(crate) fn parse_domain_pattern(domain: &str) -> Option<(FQDN, Box<[LabelPatt
 
   let mut suffix_start = labels.len();
   for i in (0..labels.len()).rev() {
-    if labels[i].contains(|c| c == '*' || c == '?') {
+    if labels[i].contains(['*', '?']) {
       suffix_start = i + 1;
       break;
     }
@@ -115,7 +115,7 @@ fn glob_match(pat: &[u8], input: &[u8]) -> bool {
 fn parse_label(label: &str) -> LabelPattern {
   if label == "*" {
     LabelPattern::AnyLabel
-  } else if label.contains(|c| c == '*' || c == '?') {
+  } else if label.contains(['*', '?']) {
     LabelPattern::Glob(label.to_ascii_lowercase().into_bytes().into())
   } else {
     LabelPattern::Literal(label.to_ascii_lowercase().into_bytes().into())
@@ -136,7 +136,7 @@ mod tests {
 
   #[test]
   fn exact_no_glob() {
-    assert!(contains_glob("example.com") == false);
+    assert!(!contains_glob("example.com"));
     assert!(contains_glob("*.example.com"));
     assert!(contains_glob("prefix-*-suffix.example.com"));
   }
