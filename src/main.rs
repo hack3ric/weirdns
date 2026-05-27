@@ -4,12 +4,11 @@ mod glob;
 mod instance;
 mod transport;
 
+use crate::config::{Cli, read_config};
+use crate::instance::start_instance;
 use async_executor::LocalExecutor;
 use futures_lite::future::block_on;
 use std::rc::Rc;
-
-use crate::config::{Cli, read_config};
-use crate::instance::start_instance;
 
 fn run() -> anyhow::Result<()> {
   let cli: Cli = argh::from_env();

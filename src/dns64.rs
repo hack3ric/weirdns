@@ -1,10 +1,8 @@
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-
-use simple_dns::rdata::{AAAA, CNAME, RData};
-use simple_dns::{CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, RCODE, ResourceRecord, TYPE};
-
 use crate::config::Rule;
 use crate::transport::{Transport, resolve};
+use simple_dns::rdata::{AAAA, CNAME, RData};
+use simple_dns::{CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, RCODE, ResourceRecord, TYPE};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAX_CNAME_DEPTH: usize = 11;
 
@@ -82,11 +80,12 @@ async fn chase_a(
       return Ok(all_records);
     }
 
-    let cname_target = a_resp
-      .answers
-      .iter()
+    let cname_target = (a_resp.answers.iter())
       .find(|rr| rr.rdata.type_code() == TYPE::CNAME)
-      .and_then(extract_cname_target)
+      .and_then(|rr| match &rr.rdata {
+        RData::CNAME(CNAME(target)) => Some(target),
+        _ => None,
+      })
       .map(|target| target.clone().into_owned());
 
     all_records.extend(a_resp.answers.into_iter().map(ResourceRecord::into_owned));
@@ -108,13 +107,6 @@ async fn chase_a(
     eprintln!("dns64: {name} max CNAME depth ({MAX_CNAME_DEPTH}) reached");
   }
   Ok(all_records)
-}
-
-fn extract_cname_target<'a>(rr: &'a ResourceRecord<'a>) -> Option<&'a Name<'a>> {
-  match &rr.rdata {
-    RData::CNAME(CNAME(target)) => Some(target),
-    _ => None,
-  }
 }
 
 pub async fn handle_dns64_rdns(
@@ -147,31 +139,30 @@ pub async fn handle_dns64_rdns(
   let resp = Packet::parse(&resp_bytes)?;
   let mut out = reply_like(&resp, query.id());
 
-  let qname_owned = qname.into_owned();
-  out.questions.extend(query.questions.into_iter().map(Question::into_owned));
-  out.answers.extend(resp.answers.into_iter().map(|rr| rename_record(rr, &qname_owned)));
-  out.name_servers.extend(resp.name_servers.into_iter().map(|rr| rename_record(rr, &qname_owned)));
-  out.additional_records.extend(
-    resp
-      .additional_records
-      .into_iter()
-      .map(|rr| rename_record(rr, &qname_owned)),
-  );
+  out.questions.extend(query.questions);
+  for (a, b) in [
+    (&mut out.answers, resp.answers),
+    (&mut out.name_servers, resp.name_servers),
+    (&mut out.additional_records, resp.additional_records),
+  ] {
+    a.extend(b.into_iter().map(|mut rr| {
+      rr.name = qname.clone();
+      rr
+    }))
+  }
 
   if log_enabled {
-    eprintln!("dns64_rdns: {qname_owned} -> {ipv4}");
+    eprintln!("dns64_rdns: {qname} -> {ipv4}");
   }
 
   Ok(out.build_bytes_vec_compressed()?)
 }
 
-fn rename_record(rr: ResourceRecord<'_>, name: &Name<'static>) -> ResourceRecord<'static> {
-  let mut rr = rr.into_owned();
-  rr.name = name.clone();
-  rr
-}
-
-fn synthesize_aaaa(prefix: Ipv6Addr, name: &Name<'_>, a_record: &ResourceRecord<'_>) -> Option<ResourceRecord<'static>> {
+fn synthesize_aaaa(
+  prefix: Ipv6Addr,
+  name: &Name<'_>,
+  a_record: &ResourceRecord<'_>,
+) -> Option<ResourceRecord<'static>> {
   let a_rdata = match &a_record.rdata {
     RData::A(a) => Ipv4Addr::from(a.address),
     _ => return None,
@@ -201,12 +192,15 @@ fn first_query_name<'a>(query: &'a Packet<'a>) -> Name<'a> {
     .map_or_else(|| Name::new_unchecked(""), |q| q.qname.clone())
 }
 
-fn build_query(id: u16, name: Name<'static>, record_type: TYPE) -> Packet<'static> {
+fn build_query(id: u16, name: Name<'_>, record_type: TYPE) -> Packet<'_> {
   let mut query = Packet::new_query(id);
   query.set_flags(PacketFlag::RECURSION_DESIRED);
-  query
-    .questions
-    .push(Question::new(name, QTYPE::TYPE(record_type), QCLASS::CLASS(CLASS::IN), false));
+  query.questions.push(Question::new(
+    name,
+    QTYPE::TYPE(record_type),
+    QCLASS::CLASS(CLASS::IN),
+    false,
+  ));
   query
 }
 
@@ -222,10 +216,11 @@ fn reply_like(src: &Packet<'_>, id: u16) -> Packet<'static> {
     PacketFlag::RECURSION_AVAILABLE,
     PacketFlag::AUTHENTIC_DATA,
     PacketFlag::CHECKING_DISABLED,
-  ]
-  .into_iter()
-  .filter(|flag| src.has_flags(*flag))
-  .fold(PacketFlag::empty(), |acc, flag| acc | flag);
+  ];
+  let flags = flags
+    .into_iter()
+    .filter(|flag| src.has_flags(*flag))
+    .fold(PacketFlag::empty(), |acc, flag| acc | flag);
   out.set_flags(flags);
   out
 }

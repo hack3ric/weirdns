@@ -1,3 +1,7 @@
+use crate::config::{Config, Rule};
+use crate::glob::{GlobValue, RuleValue, contains_glob, parse_domain_pattern};
+use crate::transport::{self, Transport};
+use crate::{dns64, print_anyhow_error};
 use anyhow::Context;
 use async_executor::LocalExecutor;
 use async_net::{TcpListener, TcpStream, UdpSocket};
@@ -8,11 +12,6 @@ use simple_dns::{Name, Packet, QTYPE, TYPE};
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::rc::Rc;
-
-use crate::config::{Config, Rule};
-use crate::glob::{GlobValue, RuleValue, contains_glob, parse_domain_pattern};
-use crate::transport::{self, Transport};
-use crate::{dns64, print_anyhow_error};
 
 pub struct Instance {
   config: Config,
@@ -119,13 +118,7 @@ impl Instance {
     }
   }
 
-  fn apply_strip_a(
-    &self,
-    qname: &Name,
-    query_id: u16,
-    qtype: TYPE,
-    resp_bytes: Vec<u8>,
-  ) -> anyhow::Result<Vec<u8>> {
+  fn apply_strip_a(&self, qname: &Name, query_id: u16, qtype: TYPE, resp_bytes: Vec<u8>) -> anyhow::Result<Vec<u8>> {
     let mut resp = Packet::parse(&resp_bytes)?;
     resp.set_id(query_id);
     let total = resp.answers.len();
