@@ -17,19 +17,21 @@ pub async fn handle_dns64(
   upstream: &[SocketAddr],
   transport: Transport,
   log_enabled: bool,
-) -> Option<Either<Message, Vec<u8>>> {
-  let prefix = rule.dns64_prefix?;
+) -> anyhow::Result<Either<Message, Vec<u8>>> {
+  let Some(prefix) = rule.dns64_prefix else {
+    anyhow::bail!("DNS64 should be enabled if this is reached")
+  };
   let qname = first_query_name(&query);
 
   if !rule.dns64_force_synth {
-    let aaaa_resp_bytes = resolve(upstream, &query.to_vec().ok()?, &qname, transport, log_enabled).await?;
-    let aaaa_resp = Message::from_vec(&aaaa_resp_bytes).ok()?;
+    let aaaa_resp_bytes = resolve(upstream, &query.to_vec()?, &qname, transport).await?;
+    let aaaa_resp = Message::from_vec(&aaaa_resp_bytes)?;
 
     if aaaa_resp.answers.iter().any(|rr| rr.record_type() == RecordType::AAAA) {
       if log_enabled {
         eprintln!("dns64: {qname} native=AAAA");
       }
-      return Some(Either::Right(aaaa_resp_bytes));
+      return Ok(Either::Right(aaaa_resp_bytes));
     }
   }
 
@@ -59,7 +61,7 @@ pub async fn handle_dns64(
   if log_enabled {
     eprintln!("dns64: {qname} synthesized={n}");
   }
-  Some(Either::Left(resp))
+  Ok(Either::Left(resp))
 }
 
 async fn chase_a(
@@ -68,14 +70,14 @@ async fn chase_a(
   upstream: &[SocketAddr],
   transport: Transport,
   log_enabled: bool,
-) -> Option<Vec<Record>> {
+) -> anyhow::Result<Vec<Record>> {
   let mut current = name.clone();
   let mut all_records: Vec<Record> = Vec::new();
 
   for hop in 0..MAX_CNAME_DEPTH {
     let a_query = build_query(id, current.clone(), RecordType::A);
-    let a_resp_bytes = resolve(upstream, &a_query.to_vec().ok()?, &current, transport, log_enabled).await?;
-    let a_resp = Message::from_vec(&a_resp_bytes).ok()?;
+    let a_resp_bytes = resolve(upstream, &a_query.to_vec()?, &current, transport).await?;
+    let a_resp = Message::from_vec(&a_resp_bytes)?;
 
     let has_a = a_resp.answers.iter().any(|rr| rr.record_type() == RecordType::A);
     if has_a {
@@ -83,7 +85,7 @@ async fn chase_a(
         eprintln!("dns64: {name} CNAME chain resolved at hop={hop}");
       }
       all_records.extend(a_resp.answers);
-      return Some(all_records);
+      return Ok(all_records);
     }
 
     let cname_target = a_resp
@@ -104,14 +106,14 @@ async fn chase_a(
         eprintln!("dns64: {name} no A or CNAME at hop={hop}");
       }
       all_records.extend(a_resp.answers);
-      return Some(all_records);
+      return Ok(all_records);
     }
   }
 
   if log_enabled {
     eprintln!("dns64: {name} max CNAME depth ({MAX_CNAME_DEPTH}) reached");
   }
-  Some(all_records)
+  Ok(all_records)
 }
 
 fn extract_cname_target(rr: &Record) -> Option<&Name> {
@@ -127,16 +129,18 @@ pub async fn handle_dns64_rdns(
   upstream: &[SocketAddr],
   transport: Transport,
   log_enabled: bool,
-) -> Option<Either<Message, Vec<u8>>> {
-  let prefix = rule.dns64_prefix?;
+) -> anyhow::Result<Either<Message, Vec<u8>>> {
+  let Some(prefix) = rule.dns64_prefix else {
+    anyhow::bail!("DNS64 should be enabled if this is reached")
+  };
   let qname = first_query_name(&query);
 
   let prefix_bytes = prefix.octets();
   let ipv6 = match qname.parse_arpa_name() {
     Ok(IpNet::V6(v6)) if v6.addr().octets()[..12] == prefix_bytes[..12] => v6.addr(),
     _ => {
-      let resp_bytes = resolve(upstream, &query.to_vec().ok()?, &qname, transport, log_enabled).await?;
-      return Some(Either::Right(resp_bytes));
+      let resp_bytes = resolve(upstream, &query.to_vec()?, &qname, transport).await?;
+      return Ok(Either::Right(resp_bytes));
     }
   };
 
@@ -145,8 +149,8 @@ pub async fn handle_dns64_rdns(
   let ptr_name: Name = ipv4.into();
 
   let ptr_query = build_query(query.id, ptr_name.clone(), RecordType::PTR);
-  let resp_bytes = resolve(upstream, &ptr_query.to_vec().ok()?, &ptr_name, transport, log_enabled).await?;
-  let mut resp = Message::from_vec(&resp_bytes).ok()?;
+  let resp_bytes = resolve(upstream, &ptr_query.to_vec()?, &ptr_name, transport).await?;
+  let mut resp = Message::from_vec(&resp_bytes)?;
   resp.metadata.id = query.id;
 
   (resp.answers.iter_mut())
@@ -159,7 +163,7 @@ pub async fn handle_dns64_rdns(
   }
   resp.queries = query.queries;
 
-  Some(Either::Left(resp))
+  Ok(Either::Left(resp))
 }
 
 fn synthesize_aaaa(prefix: Ipv6Addr, name: &Name, a_record: &Record) -> Option<Record> {

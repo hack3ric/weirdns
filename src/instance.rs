@@ -13,9 +13,9 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 
 use crate::config::{Config, Rule};
-use crate::dns64;
 use crate::glob::{GlobValue, RuleValue, contains_glob, parse_domain_pattern};
 use crate::transport::{self, Transport};
+use crate::{dns64, print_anyhow_error};
 
 pub struct Instance {
   config: Config,
@@ -69,7 +69,7 @@ impl Instance {
     None
   }
 
-  async fn handle_query(&self, query: Message, src: SocketAddr, transport: Transport) -> Option<Vec<u8>> {
+  async fn handle_query(&self, query: Message, src: SocketAddr, transport: Transport) -> anyhow::Result<Vec<u8>> {
     let (qtype, qname) = query
       .queries
       .first()
@@ -88,18 +88,12 @@ impl Instance {
       .unwrap_or(&self.config.default_upstream[..]);
 
     let resp = self.resolve_query(query, &qname, qtype, rule, addresses, transport).await;
-
-    if let Some(resp) = resp {
-      if self.log_enabled {
-        eprintln!("response: {src} {qname} len={}", resp.len());
-      }
-      Some(resp)
-    } else {
-      if self.log_enabled {
-        eprintln!("no upstream response: {src}, {qname}");
-      }
-      None
+    if let Ok(resp) = &resp
+      && self.log_enabled
+    {
+      eprintln!("response: {src} {qname} len={}", resp.len());
     }
+    resp
   }
 
   async fn resolve_query(
@@ -110,33 +104,39 @@ impl Instance {
     rule: Option<&Rule>,
     addresses: &[SocketAddr],
     transport: Transport,
-  ) -> Option<Vec<u8>> {
+  ) -> anyhow::Result<Vec<u8>> {
     match (rule, qtype) {
       (Some(rule), RecordType::AAAA) if rule.dns64_prefix.is_some() => {
         match dns64::handle_dns64(query, rule, addresses, transport, self.log_enabled).await? {
-          Either::Left(msg) => msg.to_vec().ok(),
-          Either::Right(bytes) => Some(bytes),
+          Either::Left(msg) => Ok(msg.to_vec()?),
+          Either::Right(bytes) => Ok(bytes),
         }
       }
       (Some(rule), RecordType::PTR) if rule.dns64_prefix.is_some() => {
         match dns64::handle_dns64_rdns(query, rule, addresses, transport, self.log_enabled).await? {
-          Either::Left(msg) => msg.to_vec().ok(),
-          Either::Right(bytes) => Some(bytes),
+          Either::Left(msg) => Ok(msg.to_vec()?),
+          Either::Right(bytes) => Ok(bytes),
         }
       }
       _ => {
-        let query_bytes = query.to_vec().ok()?;
-        let resp_bytes = transport::resolve(addresses, &query_bytes, qname, transport, self.log_enabled).await?;
+        let query_bytes = query.to_vec()?;
+        let resp_bytes = transport::resolve(addresses, &query_bytes, qname, transport).await?;
         match rule {
           Some(rule) if rule.strip_a => self.apply_strip_a(qname, query.id, qtype, resp_bytes),
-          _ => Some(resp_bytes),
+          _ => Ok(resp_bytes),
         }
       }
     }
   }
 
-  fn apply_strip_a(&self, qname: &Name, query_id: u16, qtype: RecordType, resp_bytes: Vec<u8>) -> Option<Vec<u8>> {
-    let mut resp = Message::from_vec(&resp_bytes).ok()?;
+  fn apply_strip_a(
+    &self,
+    qname: &Name,
+    query_id: u16,
+    qtype: RecordType,
+    resp_bytes: Vec<u8>,
+  ) -> anyhow::Result<Vec<u8>> {
+    let mut resp = Message::from_vec(&resp_bytes)?;
     resp.metadata.id = query_id;
     let total = resp.answers.len();
     if qtype == RecordType::A {
@@ -148,7 +148,7 @@ impl Instance {
     if self.log_enabled {
       eprintln!("strip_a: {qname} stripped={stripped}");
     }
-    resp.to_vec().ok()
+    Ok(resp.to_vec()?)
   }
 }
 
@@ -182,28 +182,22 @@ async fn spawn_udp_listener(
     async move {
       let mut buf = [0u8; transport::UDP_MAX_PACKET_SIZE];
       loop {
-        let (n, src) = match socket.recv_from(&mut buf).await {
-          Ok(v) => v,
-          Err(e) => {
-            eprintln!("recvfrom: {e}");
-            continue;
-          }
-        };
-
-        let Some(query) = parse_query_bytes(&buf[..n], src, "query") else {
-          continue;
-        };
-
-        ex.spawn({
-          let instance = instance.clone();
-          let socket = socket.clone();
-          async move {
-            if let Some(resp) = instance.handle_query(query, src, Transport::Udp).await {
-              let _ = socket.send_to(&resp, src).await;
+        let _ = print_anyhow_result_async(async {
+          let (n, src) = socket.recv_from(&mut buf).await.context("recvfrom")?;
+          let query = parse_query_bytes(&buf[..n], src, "query")?;
+          ex.spawn(print_anyhow_result_async({
+            let instance = instance.clone();
+            let socket = socket.clone();
+            async move {
+              let resp = instance.handle_query(query, src, Transport::Udp).await?;
+              socket.send_to(&resp, src).await?;
+              anyhow::Ok(())
             }
-          }
+          }))
+          .detach();
+          anyhow::Ok(())
         })
-        .detach();
+        .await;
       }
     }
   })
@@ -228,15 +222,16 @@ async fn spawn_tcp_listener(
     let ex = ex.clone();
     async move {
       loop {
-        let (stream, src) = match listener.accept().await {
-          Ok(v) => v,
-          Err(e) => {
-            eprintln!("tcp accept: {e}");
-            continue;
-          }
+        let Ok((stream, src)) = listener.accept().await.context("tcp accept").inspect_err(print_anyhow_error) else {
+          continue;
         };
 
-        ex.spawn(handle_tcp_stream(instance.clone(), stream, src)).detach();
+        ex.spawn(print_anyhow_result_async(handle_tcp_stream(
+          instance.clone(),
+          stream,
+          src,
+        )))
+        .detach();
       }
     }
   })
@@ -245,39 +240,32 @@ async fn spawn_tcp_listener(
   Ok(())
 }
 
-async fn handle_tcp_stream(instance: Rc<Instance>, mut stream: TcpStream, src: SocketAddr) {
-  let Some(query_buf) = read_tcp_query_bytes(&mut stream).await else {
-    return;
-  };
+async fn handle_tcp_stream(instance: Rc<Instance>, mut stream: TcpStream, src: SocketAddr) -> anyhow::Result<()> {
+  let query_buf = read_tcp_query_bytes(&mut stream).await?;
+  let query = parse_query_bytes(&query_buf, src, "TCP query")?;
 
-  let Some(query) = parse_query_bytes(&query_buf, src, "TCP query") else {
-    return;
-  };
-
-  if let Some(resp) = instance.handle_query(query, src, Transport::Tcp).await {
-    let resp_len = resp.len() as u16;
-    let _ = stream.write_all(&resp_len.to_be_bytes()).await;
-    let _ = stream.write_all(&resp).await;
-  }
+  let resp = instance.handle_query(query, src, Transport::Tcp).await?;
+  let resp_len = u16::try_from(resp.len())?;
+  stream.write_all(&resp_len.to_be_bytes()).await?;
+  stream.write_all(&resp).await?;
+  Ok(())
 }
 
-async fn read_tcp_query_bytes(stream: &mut TcpStream) -> Option<Vec<u8>> {
+async fn read_tcp_query_bytes(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
   let mut len_buf = [0u8; 2];
-  stream.read_exact(&mut len_buf).await.ok()?;
+  stream.read_exact(&mut len_buf).await?;
   let query_len = u16::from_be_bytes(len_buf) as usize;
   let mut query_buf = vec![0u8; query_len];
-  stream.read_exact(&mut query_buf).await.ok()?;
-  Some(query_buf)
+  stream.read_exact(&mut query_buf).await?;
+  Ok(query_buf)
 }
 
-fn parse_query_bytes(buf: &[u8], src: SocketAddr, label: &str) -> Option<Message> {
-  match Message::from_vec(buf) {
-    Ok(query) => Some(query),
-    Err(e) => {
-      eprintln!("failed to parse {label} from {src}: {e}");
-      None
-    }
-  }
+fn parse_query_bytes(buf: &[u8], src: SocketAddr, label: &str) -> anyhow::Result<Message> {
+  Message::from_vec(buf).with_context(|| format!("failed to parse {label} from {src}"))
+}
+
+async fn print_anyhow_result_async<T>(f: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+  f.await.inspect_err(print_anyhow_error)
 }
 
 #[cfg(test)]

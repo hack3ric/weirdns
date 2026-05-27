@@ -27,12 +27,15 @@ fn run() -> anyhow::Result<()> {
   }))
 }
 
+fn print_anyhow_error(error: &anyhow::Error) {
+  eprintln!(
+    "{}",
+    error.chain().map(ToString::to_string).collect::<Vec<_>>().join(": ")
+  );
+}
+
 fn main() {
-  if let Err(error) = run() {
-    eprintln!(
-      "{}",
-      error.chain().map(ToString::to_string).collect::<Vec<_>>().join(": ")
-    );
+  if run().inspect_err(print_anyhow_error).is_err() {
     std::process::exit(1);
   }
 }
