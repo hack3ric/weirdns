@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{Context, bail};
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -123,16 +123,126 @@ pub struct Rule {
 }
 
 #[derive(Deserialize)]
-struct ConfigFile {
+#[serde(transparent)]
+struct SocketAddrs(#[serde(deserialize_with = "deserialize_socket_addrs")] Box<[SocketAddr]>);
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct Domains(#[serde(deserialize_with = "deserialize_one_or_many")] Box<[Box<str>]>);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigBody {
+  listen: Option<SocketAddrs>,
+  default_upstream: Option<SocketAddrs>,
+  #[serde(default)]
+  log: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParsedConfigFile {
   #[serde(flatten)]
-  config: Option<Config>,
+  body: ConfigBody,
+  #[serde(rename = "rule", default)]
+  rules: Vec<ParsedRule>,
   #[serde(rename = "instance", default)]
   instances: Vec<InstanceRef>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleIncludeFile {
+  #[serde(rename = "rule", default)]
+  rules: Vec<Rule>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParsedRule {
+  include: Option<PathBuf>,
+  domains: Option<Domains>,
+  upstream: Option<SocketAddrs>,
+  dns64_prefix: Option<Ipv6Addr>,
+  #[serde(default)]
+  dns64_force_synth: bool,
+  #[serde(default)]
+  strip_a: bool,
+}
+
+enum RuleSource {
+  Inline(Rule),
+  Include(PathBuf),
+}
+
+#[derive(Deserialize)]
 struct InstanceRef {
   include: PathBuf,
+}
+
+impl ConfigBody {
+  fn has_values(&self) -> bool {
+    self.listen.is_some() || self.default_upstream.is_some() || self.log
+  }
+
+  fn into_config(self) -> anyhow::Result<Config> {
+    Ok(Config {
+      listen: self.listen.context("missing listen")?.0,
+      default_upstream: self.default_upstream.context("missing default_upstream")?.0,
+      rules: Box::new([]),
+      log: self.log,
+    })
+  }
+}
+
+impl ParsedConfigFile {
+  fn into_loaded(self) -> anyhow::Result<LoadedConfigFile> {
+    let ParsedConfigFile { body, rules, instances } = self;
+    let has_body = body.has_values() || !rules.is_empty();
+    let config = if has_body {
+      Some(LoadedConfig {
+        config: body.into_config()?,
+        rules: rules.into_iter().map(TryInto::try_into).collect::<anyhow::Result<Vec<_>>>()?,
+      })
+    } else {
+      None
+    };
+    Ok(LoadedConfigFile { config, instances })
+  }
+}
+
+struct LoadedConfigFile {
+  config: Option<LoadedConfig>,
+  instances: Vec<InstanceRef>,
+}
+
+struct LoadedConfig {
+  config: Config,
+  rules: Vec<RuleSource>,
+}
+
+impl TryFrom<ParsedRule> for RuleSource {
+  type Error = anyhow::Error;
+
+  fn try_from(value: ParsedRule) -> Result<Self, Self::Error> {
+    let ParsedRule { include, domains, upstream, dns64_prefix, dns64_force_synth, strip_a } = value;
+
+    if let Some(include) = include {
+      if domains.is_some() || upstream.is_some() || dns64_prefix.is_some() || dns64_force_synth || strip_a {
+        bail!("rule include cannot be combined with other rule fields")
+      }
+      return Ok(RuleSource::Include(include));
+    }
+
+    let domains = domains.context("rule is missing domains")?.0;
+    Ok(RuleSource::Inline(Rule {
+      domains,
+      upstream: upstream.map(|value| value.0),
+      dns64_prefix,
+      dns64_force_synth,
+      strip_a,
+    }))
+  }
 }
 
 pub fn read_config(cli: &Cli) -> anyhow::Result<Vec<Config>> {
@@ -151,17 +261,16 @@ fn read_config_inner(
     return Ok(());
   }
 
-  let display_path = path.display();
-  let content = std::fs::read_to_string(&path).with_context(|| format!("cannot open {display_path}"))?;
-  let config_file: ConfigFile = toml::from_str(&content).with_context(|| format!("parse error in {display_path}"))?;
-  if let Some(mut config) = config_file.config {
+  let loaded = parse_config_file(&path)?;
+  if let Some(LoadedConfig { mut config, rules }) = loaded.config {
+    config.rules = expand_rule_entries(rules, &path, &mut Vec::new())?.into_boxed_slice();
     config.log |= cli.verbose;
     configs.push(config);
   }
 
   let include_base = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
   visited.push(path);
-  for instance_ref in config_file.instances {
+  for instance_ref in loaded.instances {
     let include = Path::new(&*instance_ref.include);
     let include_path = if include.is_absolute() {
       include.to_path_buf()
@@ -171,6 +280,52 @@ fn read_config_inner(
     read_config_inner(cli, include_path, visited, configs)?;
   }
   Ok(())
+}
+
+fn parse_config_file(path: &Path) -> anyhow::Result<LoadedConfigFile> {
+  let display_path = path.display();
+  let content = std::fs::read_to_string(path).with_context(|| format!("cannot open {display_path}"))?;
+  let parsed: ParsedConfigFile = toml::from_str(&content).with_context(|| format!("parse error in {display_path}"))?;
+  parsed.into_loaded().with_context(|| format!("parse error in {display_path}"))
+}
+
+fn parse_rule_include_file(path: &Path) -> anyhow::Result<Vec<Rule>> {
+  let display_path = path.display();
+  let content = std::fs::read_to_string(path).with_context(|| format!("cannot open {display_path}"))?;
+  let parsed: RuleIncludeFile = toml::from_str(&content).with_context(|| format!("parse error in {display_path}"))?;
+  Ok(parsed.rules)
+}
+
+fn expand_rule_entries(
+  entries: Vec<RuleSource>,
+  source_path: &Path,
+  visited_rule_files: &mut Vec<PathBuf>,
+) -> anyhow::Result<Vec<Rule>> {
+  let mut rules = Vec::new();
+  let include_base = source_path.parent().unwrap_or_else(|| Path::new("."));
+
+  for entry in entries {
+    match entry {
+      RuleSource::Inline(rule) => rules.push(rule),
+      RuleSource::Include(include) => {
+        let include_path = if include.is_absolute() {
+          include
+        } else {
+          include_base.join(include)
+        };
+
+        if visited_rule_files.contains(&include_path) {
+          bail!("rule include cycle detected at {}", include_path.display());
+        }
+
+        visited_rule_files.push(include_path.clone());
+        rules.extend(parse_rule_include_file(&include_path)?);
+        visited_rule_files.pop();
+      }
+    }
+  }
+
+  Ok(rules)
 }
 
 #[cfg(test)]
@@ -232,5 +387,196 @@ mod tests {
       config.rules[0].upstream.as_ref().unwrap()[0],
       "8.8.8.8:53".parse().unwrap()
     );
+  }
+
+  #[test]
+  fn expands_rule_include_file_with_multiple_rules() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("weirdns-rule-include-test-{unique}"));
+    fs::create_dir_all(&root).unwrap();
+
+    let main = root.join("main.toml");
+    let rules = root.join("rules.toml");
+
+    fs::write(
+      &main,
+      concat!(
+        "listen = \"127.0.0.1:5300\"\n",
+        "default_upstream = \"1.1.1.1\"\n",
+        "\n",
+        "[[rule]]\n",
+        "domains = \"local.example\"\n",
+        "\n",
+        "[[rule]]\n",
+        "include = \"rules.toml\"\n",
+      ),
+    )
+    .unwrap();
+    fs::write(
+      &rules,
+      concat!(
+        "[[rule]]\n",
+        "domains = \"example.com\"\n",
+        "\n",
+        "[[rule]]\n",
+        "domains = \"example.org\"\n",
+      ),
+    )
+    .unwrap();
+
+    let configs = read_config(&make_cli(main.display().to_string())).unwrap();
+    let domains: Vec<&str> = configs[0].rules.iter().map(|rule| &*rule.domains[0]).collect();
+    assert_eq!(domains, vec!["local.example", "example.com", "example.org"]);
+
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn resolves_rule_includes_relative_to_parent_config() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("weirdns-rule-relative-test-{unique}"));
+    let nested = root.join("rules");
+    fs::create_dir_all(&nested).unwrap();
+
+    let main = root.join("main.toml");
+    let child = nested.join("child.toml");
+
+    fs::write(
+      &main,
+      concat!(
+        "listen = \"127.0.0.1:5300\"\n",
+        "default_upstream = \"1.1.1.1\"\n",
+        "\n",
+        "[[rule]]\n",
+        "include = \"rules/child.toml\"\n",
+      ),
+    )
+    .unwrap();
+    fs::write(&child, "[[rule]]\ndomains = \"example.com\"\n").unwrap();
+
+    let configs = read_config(&make_cli(main.display().to_string())).unwrap();
+    assert_eq!(&*configs[0].rules[0].domains[0], "example.com");
+
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn preserves_inline_rule_include_order() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("weirdns-rule-order-test-{unique}"));
+    fs::create_dir_all(&root).unwrap();
+
+    let main = root.join("main.toml");
+    let include = root.join("include.toml");
+
+    fs::write(
+      &main,
+      concat!(
+        "listen = \"127.0.0.1:5300\"\n",
+        "default_upstream = \"1.1.1.1\"\n",
+        "\n",
+        "[[rule]]\n",
+        "domains = \"before.example\"\n",
+        "\n",
+        "[[rule]]\n",
+        "include = \"include.toml\"\n",
+        "\n",
+        "[[rule]]\n",
+        "domains = \"after.example\"\n",
+      ),
+    )
+    .unwrap();
+    fs::write(&include, "[[rule]]\ndomains = \"middle.example\"\n").unwrap();
+
+    let configs = read_config(&make_cli(main.display().to_string())).unwrap();
+    let domains: Vec<&str> = configs[0].rules.iter().map(|rule| &*rule.domains[0]).collect();
+    assert_eq!(domains, vec!["before.example", "middle.example", "after.example"]);
+
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn rejects_mixed_rule_include_and_inline_fields() {
+    let result = toml::from_str::<ParsedConfigFile>(concat!(
+      "listen = \"127.0.0.1:5300\"\n",
+      "default_upstream = \"1.1.1.1\"\n",
+      "\n",
+      "[[rule]]\n",
+      "include = \"rules.toml\"\n",
+      "domains = \"example.com\"\n",
+    ))
+    .unwrap()
+    .into_loaded();
+
+    let err = match result {
+      Ok(_) => panic!("expected mixed rule include to fail"),
+      Err(err) => err,
+    };
+
+    assert!(err.to_string().contains("rule include cannot be combined"));
+  }
+
+  #[test]
+  fn rejects_non_rule_content_in_rule_include_file() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("weirdns-rule-invalid-test-{unique}"));
+    fs::create_dir_all(&root).unwrap();
+
+    let main = root.join("main.toml");
+    let include = root.join("include.toml");
+
+    fs::write(
+      &main,
+      concat!(
+        "listen = \"127.0.0.1:5300\"\n",
+        "default_upstream = \"1.1.1.1\"\n",
+        "\n",
+        "[[rule]]\n",
+        "include = \"include.toml\"\n",
+      ),
+    )
+    .unwrap();
+    fs::write(&include, "listen = \"127.0.0.1:5301\"\n").unwrap();
+
+    let err = match read_config(&make_cli(main.display().to_string())) {
+      Ok(_) => panic!("expected invalid rule include file to fail"),
+      Err(err) => err,
+    };
+    assert!(err.to_string().contains("parse error in"));
+
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn rejects_nested_rule_includes_in_rule_files() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let root = std::env::temp_dir().join(format!("weirdns-rule-cycle-test-{unique}"));
+    fs::create_dir_all(&root).unwrap();
+
+    let main = root.join("main.toml");
+    let a = root.join("a.toml");
+    let b = root.join("b.toml");
+
+    fs::write(
+      &main,
+      concat!(
+        "listen = \"127.0.0.1:5300\"\n",
+        "default_upstream = \"1.1.1.1\"\n",
+        "\n",
+        "[[rule]]\n",
+        "include = \"a.toml\"\n",
+      ),
+    )
+    .unwrap();
+    fs::write(&a, "[[rule]]\ninclude = \"b.toml\"\n").unwrap();
+    fs::write(&b, "[[rule]]\ninclude = \"a.toml\"\n").unwrap();
+
+    let err = match read_config(&make_cli(main.display().to_string())) {
+      Ok(_) => panic!("expected nested rule include to fail"),
+      Err(err) => err,
+    };
+    assert!(err.to_string().contains("parse error in"));
+
+    fs::remove_dir_all(root).unwrap();
   }
 }
