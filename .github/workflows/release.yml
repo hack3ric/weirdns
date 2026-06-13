@@ -1,0 +1,41 @@
+name: Release .deb
+
+on:
+  release:
+    types:
+      - created
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build .deb
+        run: cargo deb
+
+      - name: Generate SHA256
+        run: |
+          deb_path="$(find target/debian -maxdepth 1 -type f -name '*.deb' | head -n 1)"
+          if [ -z "$deb_path" ]; then
+            echo "No .deb artifact found in target/debian" >&2
+            exit 1
+          fi
+          sha256sum "$deb_path" > "$deb_path.sha256"
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/debian/*.deb
+            target/debian/*.deb.sha256
