@@ -216,20 +216,21 @@ mod tests {
 
   #[test]
   fn deserializes_single_upstream_value() {
-    let config: Config = toml::from_str(
-      concat!(
-        "listen = \"127.0.0.1\"\n",
-        "default_upstream = \"1.1.1.1\"\n",
-        "\n",
-        "[[rule]]\n",
-        "domains = \"example.com\"\n",
-        "upstream = \"8.8.8.8\"\n",
-      ),
-    )
+    let config: Config = toml::from_str(concat!(
+      "listen = \"127.0.0.1\"\n",
+      "default_upstream = \"1.1.1.1\"\n",
+      "\n",
+      "[[rule]]\n",
+      "domains = \"example.com\"\n",
+      "upstream = \"8.8.8.8\"\n",
+    ))
     .unwrap();
 
     assert_eq!(config.listen[0], "127.0.0.1:53".parse().unwrap());
     assert_eq!(config.default_upstream[0], "1.1.1.1:53".parse().unwrap());
-    assert_eq!(config.rules[0].upstream.as_ref().unwrap()[0], "8.8.8.8:53".parse().unwrap());
+    assert_eq!(
+      config.rules[0].upstream.as_ref().unwrap()[0],
+      "8.8.8.8:53".parse().unwrap()
+    );
   }
 }

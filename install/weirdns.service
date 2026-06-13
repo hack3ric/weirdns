@@ -5,7 +5,8 @@ After=network.target
 Wants=network.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/bin/weirdns -c /etc/weirdns/weirdns.toml
 Restart=on-failure
 RestartSec=5s

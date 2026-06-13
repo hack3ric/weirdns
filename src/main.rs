@@ -2,6 +2,7 @@ mod config;
 mod dns64;
 mod glob;
 mod instance;
+mod notify;
 mod transport;
 
 use crate::config::{Cli, read_config};
@@ -21,6 +22,7 @@ fn run() -> anyhow::Result<()> {
       for config in configs {
         start_instance(ex.clone(), config).await?;
       }
+      notify::ready();
       std::future::pending().await
     }
   }))
@@ -34,7 +36,8 @@ fn print_anyhow_error(error: &anyhow::Error) {
 }
 
 fn main() {
-  if run().inspect_err(print_anyhow_error).is_err() {
+  if let Err(error) = run() {
+    print_anyhow_error(&error);
     std::process::exit(1);
   }
 }
