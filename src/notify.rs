@@ -36,27 +36,18 @@ fn notify(message: &str) -> std::io::Result<()> {
 
     if let Some(name) = path.strip_prefix(b"@") {
       let addr = SocketAddr::from_abstract_name(name)?;
-      socket.connect_addr(&addr)?;
+      socket.send_to_addr(message.as_bytes(), &addr)?;
     } else {
-      socket.connect(Path::new(&socket_path))?;
+      socket.send_to(message.as_bytes(), Path::new(&socket_path))?;
     }
   }
 
   #[cfg(not(target_os = "linux"))]
   {
     use std::path::Path;
-    socket.connect(Path::new(&socket_path))?;
+    socket.send_to(message.as_bytes(), Path::new(&socket_path))?;
   }
-
-  let written = socket.send(message.as_bytes())?;
-  if written == message.len() {
-    Ok(())
-  } else {
-    Err(std::io::Error::new(
-      std::io::ErrorKind::WriteZero,
-      "short write to NOTIFY_SOCKET",
-    ))
-  }
+  Ok(())
 }
 
 #[cfg(not(unix))]
