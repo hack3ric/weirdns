@@ -268,16 +268,11 @@ fn read_config_inner(
     configs.push(config);
   }
 
-  let include_base = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
-  visited.push(path);
+  visited.push(path.clone());
   for instance_ref in loaded.instances {
-    let include = Path::new(&*instance_ref.include);
-    let include_path = if include.is_absolute() {
-      include.to_path_buf()
-    } else {
-      include_base.join(include)
-    };
-    read_config_inner(cli, include_path, visited, configs)?;
+    for include_path in resolve_include_paths(&path, &instance_ref.include)? {
+      read_config_inner(cli, include_path, visited, configs)?;
+    }
   }
   Ok(())
 }
@@ -302,30 +297,81 @@ fn expand_rule_entries(
   visited_rule_files: &mut Vec<PathBuf>,
 ) -> anyhow::Result<Vec<Rule>> {
   let mut rules = Vec::new();
-  let include_base = source_path.parent().unwrap_or_else(|| Path::new("."));
 
   for entry in entries {
     match entry {
       RuleSource::Inline(rule) => rules.push(rule),
       RuleSource::Include(include) => {
-        let include_path = if include.is_absolute() {
-          include
-        } else {
-          include_base.join(include)
-        };
+        for include_path in resolve_include_paths(source_path, &include)? {
+          if visited_rule_files.contains(&include_path) {
+            bail!("rule include cycle detected at {}", include_path.display());
+          }
 
-        if visited_rule_files.contains(&include_path) {
-          bail!("rule include cycle detected at {}", include_path.display());
+          visited_rule_files.push(include_path.clone());
+          rules.extend(parse_rule_include_file(&include_path)?);
+          visited_rule_files.pop();
         }
-
-        visited_rule_files.push(include_path.clone());
-        rules.extend(parse_rule_include_file(&include_path)?);
-        visited_rule_files.pop();
       }
     }
   }
 
   Ok(rules)
+}
+
+fn resolve_include_paths(source_path: &Path, include: &Path) -> anyhow::Result<Vec<PathBuf>> {
+  let resolved = if include.is_absolute() {
+    include.to_path_buf()
+  } else {
+    source_path.parent().unwrap_or_else(|| Path::new(".")).join(include)
+  };
+
+  expand_glob(&resolved)
+}
+
+fn expand_glob(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+  let star_count = path.as_os_str().as_encoded_bytes().iter().filter(|&&b| b == b'*').count();
+  if star_count == 0 {
+    return Ok(vec![path.to_path_buf()]);
+  }
+  if star_count > 1 {
+    bail!("include pattern must contain at most one '*': {}", path.display());
+  }
+
+  let path_str = path
+    .to_str()
+    .with_context(|| format!("include path is not valid UTF-8: {}", path.display()))?;
+  let (prefix, suffix) = path_str.split_once('*').expect("counted one star");
+  let search_dir = if prefix.ends_with(std::path::MAIN_SEPARATOR) {
+    PathBuf::from(prefix)
+  } else {
+    Path::new(prefix)
+      .parent()
+      .map(Path::to_path_buf)
+      .unwrap_or_else(|| PathBuf::from("."))
+  };
+  let suffix_str = suffix.to_owned();
+  let mut matches = Vec::new();
+
+  let entries = match std::fs::read_dir(&search_dir) {
+    Ok(entries) => entries,
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+    Err(err) => return Err(err).with_context(|| format!("cannot open {}", search_dir.display())),
+  };
+
+  for entry in entries {
+    let entry = entry.with_context(|| format!("cannot read {}", search_dir.display()))?;
+    let entry_path = entry.path();
+    let entry_str = match entry_path.to_str() {
+      Some(value) => value,
+      None => continue,
+    };
+    if entry_str.starts_with(prefix) && entry_str.ends_with(&suffix_str) {
+      matches.push(entry_path);
+    }
+  }
+
+  matches.sort();
+  Ok(matches)
 }
 
 #[cfg(test)]
@@ -338,10 +384,14 @@ mod tests {
     Cli { config: config.into(), verbose: false }
   }
 
+  fn unique_root(name: &str) -> PathBuf {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    std::env::temp_dir().join(format!("weirdns-{name}-{unique}"))
+  }
+
   #[test]
   fn resolves_instance_includes_relative_to_parent_config() {
-    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let root = std::env::temp_dir().join(format!("weirdns-config-test-{unique}"));
+    let root = unique_root("config-test");
     let nested = root.join("instances");
     fs::create_dir_all(&nested).unwrap();
 
@@ -391,8 +441,7 @@ mod tests {
 
   #[test]
   fn expands_rule_include_file_with_multiple_rules() {
-    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let root = std::env::temp_dir().join(format!("weirdns-rule-include-test-{unique}"));
+    let root = unique_root("rule-include-test");
     fs::create_dir_all(&root).unwrap();
 
     let main = root.join("main.toml");
@@ -433,8 +482,7 @@ mod tests {
 
   #[test]
   fn resolves_rule_includes_relative_to_parent_config() {
-    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let root = std::env::temp_dir().join(format!("weirdns-rule-relative-test-{unique}"));
+    let root = unique_root("rule-relative-test");
     let nested = root.join("rules");
     fs::create_dir_all(&nested).unwrap();
 
@@ -462,8 +510,7 @@ mod tests {
 
   #[test]
   fn preserves_inline_rule_include_order() {
-    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let root = std::env::temp_dir().join(format!("weirdns-rule-order-test-{unique}"));
+    let root = unique_root("rule-order-test");
     fs::create_dir_all(&root).unwrap();
 
     let main = root.join("main.toml");
@@ -518,8 +565,7 @@ mod tests {
 
   #[test]
   fn rejects_non_rule_content_in_rule_include_file() {
-    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let root = std::env::temp_dir().join(format!("weirdns-rule-invalid-test-{unique}"));
+    let root = unique_root("rule-invalid-test");
     fs::create_dir_all(&root).unwrap();
 
     let main = root.join("main.toml");
@@ -549,8 +595,7 @@ mod tests {
 
   #[test]
   fn rejects_nested_rule_includes_in_rule_files() {
-    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-    let root = std::env::temp_dir().join(format!("weirdns-rule-cycle-test-{unique}"));
+    let root = unique_root("rule-cycle-test");
     fs::create_dir_all(&root).unwrap();
 
     let main = root.join("main.toml");
@@ -576,6 +621,116 @@ mod tests {
       Err(err) => err,
     };
     assert!(err.to_string().contains("parse error in"));
+
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn expands_instance_include_glob_in_lexicographic_order() {
+    let root = unique_root("instance-glob-test");
+    let instances = root.join("instances");
+    fs::create_dir_all(&instances).unwrap();
+
+    let main = root.join("main.toml");
+    fs::write(&main, concat!("[[instance]]\n", "include = \"instances/*.toml\"\n",)).unwrap();
+    fs::write(
+      instances.join("b.toml"),
+      "listen = \"127.0.0.1:5302\"\ndefault_upstream = \"1.0.0.2\"\n",
+    )
+    .unwrap();
+    fs::write(
+      instances.join("a.toml"),
+      "listen = \"127.0.0.1:5301\"\ndefault_upstream = \"1.0.0.1\"\n",
+    )
+    .unwrap();
+
+    let configs = read_config(&make_cli(main.display().to_string())).unwrap();
+    assert_eq!(configs.len(), 2);
+    assert_eq!(configs[0].listen[0], "127.0.0.1:5301".parse().unwrap());
+    assert_eq!(configs[1].listen[0], "127.0.0.1:5302".parse().unwrap());
+
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn expands_rule_include_glob_in_lexicographic_order() {
+    let root = unique_root("rule-glob-test");
+    let rules_dir = root.join("rules");
+    fs::create_dir_all(&rules_dir).unwrap();
+
+    let main = root.join("main.toml");
+    fs::write(
+      &main,
+      concat!(
+        "listen = \"127.0.0.1:5300\"\n",
+        "default_upstream = \"1.1.1.1\"\n",
+        "\n",
+        "[[rule]]\n",
+        "include = \"rules/*.toml\"\n",
+      ),
+    )
+    .unwrap();
+    fs::write(rules_dir.join("20.toml"), "[[rule]]\ndomains = \"b.example\"\n").unwrap();
+    fs::write(rules_dir.join("10.toml"), "[[rule]]\ndomains = \"a.example\"\n").unwrap();
+
+    let configs = read_config(&make_cli(main.display().to_string())).unwrap();
+    let domains: Vec<&str> = configs[0].rules.iter().map(|rule| &*rule.domains[0]).collect();
+    assert_eq!(domains, vec!["a.example", "b.example"]);
+
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn ignores_unmatched_include_globs() {
+    let root = unique_root("glob-empty-test");
+    fs::create_dir_all(&root).unwrap();
+
+    let main = root.join("main.toml");
+    fs::write(
+      &main,
+      concat!(
+        "listen = \"127.0.0.1:5300\"\n",
+        "default_upstream = \"1.1.1.1\"\n",
+        "\n",
+        "[[rule]]\n",
+        "include = \"rules/*.toml\"\n",
+        "\n",
+        "[[instance]]\n",
+        "include = \"instances/*.toml\"\n",
+      ),
+    )
+    .unwrap();
+
+    let configs = read_config(&make_cli(main.display().to_string())).unwrap();
+    assert_eq!(configs.len(), 1);
+    assert!(configs[0].rules.is_empty());
+
+    fs::remove_dir_all(root).unwrap();
+  }
+
+  #[test]
+  fn rejects_include_patterns_with_multiple_stars() {
+    let root = unique_root("glob-invalid-test");
+    fs::create_dir_all(&root).unwrap();
+
+    let main = root.join("main.toml");
+    fs::write(
+      &main,
+      concat!(
+        "listen = \"127.0.0.1:5300\"\n",
+        "default_upstream = \"1.1.1.1\"\n",
+        "\n",
+        "[[rule]]\n",
+        "include = \"rules/*/*.toml\"\n",
+      ),
+    )
+    .unwrap();
+
+    let err = match read_config(&make_cli(main.display().to_string())) {
+      Ok(_) => panic!("expected multi-star include to fail"),
+      Err(err) => err,
+    };
+    assert!(err.to_string().contains("at most one '*'"));
 
     fs::remove_dir_all(root).unwrap();
   }
