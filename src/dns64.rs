@@ -1,10 +1,16 @@
 use crate::config::Rule;
 use crate::transport::{Transport, resolve};
-use simple_dns::rdata::{AAAA, CNAME, RData};
+use simple_dns::rdata::{AAAA, CNAME, HTTPS, RData, SVCB, SVCParam};
 use simple_dns::{CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, RCODE, ResourceRecord, TYPE};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAX_CNAME_DEPTH: usize = 11;
+
+struct ChangedRrset {
+  name: Name<'static>,
+  class: CLASS,
+  record_type: TYPE,
+}
 
 pub async fn handle_dns64(
   query: Packet<'_>,
@@ -54,6 +60,117 @@ pub async fn handle_dns64(
     eprintln!("dns64: {qname} synthesized={n}");
   }
   Ok(resp.build_bytes_vec_compressed()?)
+}
+
+pub fn mangle_svcb_response(
+  qname: &Name<'_>,
+  resp_bytes: Vec<u8>,
+  rule: &Rule,
+  log_enabled: bool,
+) -> anyhow::Result<Vec<u8>> {
+  let mut resp = Packet::parse(&resp_bytes)?;
+  let mut changed_rrsets = Vec::new();
+  let mut changed_records = 0;
+
+  for rr in &mut resp.answers {
+    let record_type = rr.rdata.type_code();
+    let rewritten = match &rr.rdata {
+      RData::SVCB(svcb) => mangle_svcb(svcb, rule).map(RData::SVCB),
+      RData::HTTPS(https) => mangle_svcb(https, rule).map(|svcb| RData::HTTPS(HTTPS::from(svcb))),
+      _ => None,
+    };
+
+    if let Some(rdata) = rewritten {
+      rr.rdata = rdata;
+      changed_rrsets.push(ChangedRrset { name: rr.name.clone().into_owned(), class: rr.class, record_type });
+      changed_records += 1;
+    }
+  }
+
+  if changed_records == 0 {
+    return Ok(resp_bytes);
+  }
+
+  resp.remove_flags(PacketFlag::AUTHENTIC_DATA);
+  let records_before = resp.answers.len() + resp.name_servers.len() + resp.additional_records.len();
+  for records in [&mut resp.answers, &mut resp.name_servers, &mut resp.additional_records] {
+    records.retain(|rr| !is_invalidated_signature(rr, &changed_rrsets));
+  }
+  let records_after = resp.answers.len() + resp.name_servers.len() + resp.additional_records.len();
+
+  if log_enabled {
+    eprintln!(
+      "dns64_svcb: {qname} changed={changed_records} signatures_removed={}",
+      records_before - records_after
+    );
+  }
+
+  Ok(resp.build_bytes_vec_compressed()?)
+}
+
+fn mangle_svcb(svcb: &SVCB<'_>, rule: &Rule) -> Option<SVCB<'static>> {
+  let ipv4hint = svcb.iter_params().find_map(|param| match param {
+    SVCParam::Ipv4Hint(ips) => Some(ips.clone()),
+    _ => None,
+  });
+  let ipv6hint = svcb.iter_params().find_map(|param| match param {
+    SVCParam::Ipv6Hint(ips) => Some(ips.clone()),
+    _ => None,
+  });
+
+  let rewritten_ipv4hint = if rule.strip_a { None } else { ipv4hint.clone() };
+  let rewritten_ipv6hint = match rule.dns64_prefix {
+    Some(prefix) if rule.dns64_force_synth || ipv6hint.is_none() => ipv4hint.as_ref().map(|ips| {
+      ips
+        .iter()
+        .map(|ip| u128::from(synthesize_ipv6(prefix, Ipv4Addr::from(*ip))))
+        .collect()
+    }),
+    _ => ipv6hint.clone(),
+  };
+
+  if rewritten_ipv4hint == ipv4hint && rewritten_ipv6hint == ipv6hint {
+    return None;
+  }
+
+  let mut rewritten = SVCB::new(svcb.priority, svcb.target.clone().into_owned());
+  for param in svcb.iter_params() {
+    match param {
+      SVCParam::Ipv4Hint(_) | SVCParam::Ipv6Hint(_) => {}
+      SVCParam::Mandatory(keys) => {
+        let mut rewritten_keys = keys.clone();
+        if rewritten_ipv4hint.is_none() {
+          rewritten_keys.remove(&4);
+        }
+        if rewritten_ipv6hint.is_none() {
+          rewritten_keys.remove(&6);
+        }
+        if !rewritten_keys.is_empty() || rewritten_keys == *keys {
+          rewritten.set_param(SVCParam::Mandatory(rewritten_keys));
+        }
+      }
+      _ => rewritten.set_param(param.clone().into_owned()),
+    }
+  }
+
+  if let Some(ips) = rewritten_ipv4hint {
+    rewritten.set_param(SVCParam::Ipv4Hint(ips));
+  }
+  if let Some(ips) = rewritten_ipv6hint {
+    rewritten.set_param(SVCParam::Ipv6Hint(ips));
+  }
+
+  Some(rewritten)
+}
+
+fn is_invalidated_signature(rr: &ResourceRecord<'_>, changed_rrsets: &[ChangedRrset]) -> bool {
+  let RData::RRSIG(signature) = &rr.rdata else {
+    return false;
+  };
+
+  changed_rrsets.iter().any(|changed| {
+    rr.name == changed.name && rr.class == changed.class && signature.type_covered == u16::from(changed.record_type)
+  })
 }
 
 async fn chase_a(
@@ -168,14 +285,7 @@ fn synthesize_aaaa(
     _ => return None,
   };
 
-  let prefix_bytes = prefix.octets();
-  let a_bytes = a_rdata.octets();
-
-  let mut ipv6_bytes = [0u8; 16];
-  ipv6_bytes[..12].copy_from_slice(&prefix_bytes[..12]);
-  ipv6_bytes[12..].copy_from_slice(&a_bytes);
-
-  let ipv6 = Ipv6Addr::from(ipv6_bytes);
+  let ipv6 = synthesize_ipv6(prefix, a_rdata);
 
   Some(ResourceRecord::new(
     name.clone().into_owned(),
@@ -183,6 +293,16 @@ fn synthesize_aaaa(
     a_record.ttl,
     RData::AAAA(AAAA::from(ipv6)),
   ))
+}
+
+fn synthesize_ipv6(prefix: Ipv6Addr, ipv4: Ipv4Addr) -> Ipv6Addr {
+  let prefix_bytes = prefix.octets();
+  let ipv4_bytes = ipv4.octets();
+
+  let mut ipv6_bytes = [0u8; 16];
+  ipv6_bytes[..12].copy_from_slice(&prefix_bytes[..12]);
+  ipv6_bytes[12..].copy_from_slice(&ipv4_bytes);
+  Ipv6Addr::from(ipv6_bytes)
 }
 
 fn first_query_name<'a>(query: &'a Packet<'a>) -> Name<'a> {
@@ -253,4 +373,239 @@ fn parse_ip6_arpa_name(name: &Name<'_>) -> Option<Ipv6Addr> {
     bytes[i] = u8::from_str_radix(hex, 16).ok()?;
   }
   Some(Ipv6Addr::from(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use simple_dns::rdata::{A, RRSIG};
+  use std::collections::BTreeSet;
+
+  const PREFIX: &str = "64:ff9b::";
+
+  fn rule(dns64: bool, force: bool, strip_a: bool) -> Rule {
+    Rule {
+      domains: Box::new([]),
+      upstream: None,
+      dns64_prefix: dns64.then(|| PREFIX.parse().unwrap()),
+      dns64_force_synth: force,
+      strip_a,
+    }
+  }
+
+  fn name(value: &str) -> Name<'static> {
+    Name::new(value).unwrap().into_owned()
+  }
+
+  fn service(target: &str, ipv4hints: &[Ipv4Addr], ipv6hints: &[Ipv6Addr], mandatory: &[u16]) -> SVCB<'static> {
+    let mut svcb = SVCB::new(1, name(target));
+    svcb.set_port(8443);
+    svcb.set_ipv4hint(&ipv4hints.iter().copied().map(u32::from).collect::<Vec<_>>());
+    svcb.set_ipv6hint(&ipv6hints.iter().copied().map(u128::from).collect::<Vec<_>>());
+    if !mandatory.is_empty() {
+      svcb.set_param(SVCParam::Mandatory(mandatory.iter().copied().collect()));
+    }
+    svcb
+  }
+
+  fn service_record(owner: &str, record_type: TYPE, svcb: SVCB<'static>) -> ResourceRecord<'static> {
+    let rdata = match record_type {
+      TYPE::HTTPS => RData::HTTPS(HTTPS::from(svcb)),
+      TYPE::SVCB => RData::SVCB(svcb),
+      _ => panic!("not a service-binding record type"),
+    };
+    ResourceRecord::new(name(owner), CLASS::IN, 300, rdata)
+  }
+
+  fn rrsig(owner: &str, covered_type: TYPE) -> ResourceRecord<'static> {
+    ResourceRecord::new(
+      name(owner),
+      CLASS::IN,
+      300,
+      RData::RRSIG(RRSIG {
+        type_covered: u16::from(covered_type),
+        algorithm: 15,
+        labels: 2,
+        original_ttl: 300,
+        signature_expiration: 2_000_000_000,
+        signature_inception: 1_000_000_000,
+        key_tag: 1234,
+        signer_name: name("example"),
+        signature: vec![1, 2, 3, 4].into(),
+      }),
+    )
+  }
+
+  fn service_data<'a, 'b>(rr: &'a ResourceRecord<'b>) -> &'a SVCB<'b> {
+    match &rr.rdata {
+      RData::HTTPS(https) => https,
+      RData::SVCB(svcb) => svcb,
+      _ => panic!("not a service-binding record"),
+    }
+  }
+
+  fn ipv4hints(svcb: &SVCB<'_>) -> Option<Vec<Ipv4Addr>> {
+    svcb.iter_params().find_map(|param| match param {
+      SVCParam::Ipv4Hint(ips) => Some(ips.iter().copied().map(Ipv4Addr::from).collect()),
+      _ => None,
+    })
+  }
+
+  fn ipv6hints(svcb: &SVCB<'_>) -> Option<Vec<Ipv6Addr>> {
+    svcb.iter_params().find_map(|param| match param {
+      SVCParam::Ipv6Hint(ips) => Some(ips.iter().copied().map(Ipv6Addr::from).collect()),
+      _ => None,
+    })
+  }
+
+  fn mandatory(svcb: &SVCB<'_>) -> Option<BTreeSet<u16>> {
+    svcb.iter_params().find_map(|param| match param {
+      SVCParam::Mandatory(keys) => Some(keys.clone()),
+      _ => None,
+    })
+  }
+
+  fn packet_bytes(answers: Vec<ResourceRecord<'static>>) -> Vec<u8> {
+    let mut packet = Packet::new_reply(0x1234);
+    packet.set_flags(PacketFlag::RECURSION_AVAILABLE);
+    packet.answers = answers;
+    packet.build_bytes_vec_compressed().unwrap()
+  }
+
+  #[test]
+  fn mangles_https_and_svcb_hints_per_record() {
+    let ipv4_a = "192.0.2.1".parse().unwrap();
+    let ipv4_b = "198.51.100.2".parse().unwrap();
+    let native_ipv6 = "2001:db8::2".parse().unwrap();
+    let bytes = packet_bytes(vec![
+      service_record(
+        "a.example",
+        TYPE::HTTPS,
+        service("target-a.example", &[ipv4_a], &[], &[3, 4]),
+      ),
+      service_record(
+        "b.example",
+        TYPE::SVCB,
+        service("target-b.example", &[ipv4_b], &[native_ipv6], &[4, 6]),
+      ),
+    ]);
+
+    let rewritten = mangle_svcb_response(&name("example"), bytes, &rule(true, false, true), false).unwrap();
+    let packet = Packet::parse(&rewritten).unwrap();
+    let first = service_data(&packet.answers[0]);
+    let second = service_data(&packet.answers[1]);
+
+    assert_eq!(first.priority, 1);
+    assert_eq!(first.target, name("target-a.example"));
+    assert!(matches!(first.get_param(3), Some(SVCParam::Port(8443))));
+    assert_eq!(ipv4hints(first), None);
+    assert_eq!(ipv6hints(first), Some(vec!["64:ff9b::c000:201".parse().unwrap()]));
+    assert_eq!(mandatory(first), Some(BTreeSet::from([3])));
+
+    assert_eq!(ipv4hints(second), None);
+    assert_eq!(ipv6hints(second), Some(vec![native_ipv6]));
+    assert_eq!(mandatory(second), Some(BTreeSet::from([6])));
+  }
+
+  #[test]
+  fn forced_synthesis_replaces_or_removes_native_ipv6hints() {
+    let ipv4 = "203.0.113.9".parse().unwrap();
+    let native_ipv6 = "2001:db8::9".parse().unwrap();
+    let bytes = packet_bytes(vec![
+      service_record(
+        "with-v4.example",
+        TYPE::HTTPS,
+        service("target.example", &[ipv4], &[native_ipv6], &[4, 6]),
+      ),
+      service_record(
+        "without-v4.example",
+        TYPE::HTTPS,
+        service("target.example", &[], &[native_ipv6], &[6]),
+      ),
+    ]);
+
+    let rewritten = mangle_svcb_response(&name("example"), bytes, &rule(true, true, false), false).unwrap();
+    let packet = Packet::parse(&rewritten).unwrap();
+    let with_ipv4 = service_data(&packet.answers[0]);
+    let without_ipv4 = service_data(&packet.answers[1]);
+
+    assert_eq!(ipv4hints(with_ipv4), Some(vec![ipv4]));
+    assert_eq!(ipv6hints(with_ipv4), Some(vec!["64:ff9b::cb00:7109".parse().unwrap()]));
+    assert_eq!(mandatory(with_ipv4), Some(BTreeSet::from([4, 6])));
+    assert_eq!(ipv6hints(without_ipv4), None);
+    assert_eq!(mandatory(without_ipv4), None);
+  }
+
+  #[test]
+  fn strip_a_removes_ipv4hint_without_dns64() {
+    let ipv4 = "192.0.2.10".parse().unwrap();
+    let native_ipv6 = "2001:db8::10".parse().unwrap();
+    let original = service("target.example", &[ipv4], &[native_ipv6], &[4, 6]);
+
+    let rewritten = mangle_svcb(&original, &rule(false, false, true)).unwrap();
+
+    assert_eq!(ipv4hints(&rewritten), None);
+    assert_eq!(ipv6hints(&rewritten), Some(vec![native_ipv6]));
+    assert_eq!(mandatory(&rewritten), Some(BTreeSet::from([6])));
+  }
+
+  #[test]
+  fn unchanged_response_is_returned_byte_for_byte() {
+    let bytes = packet_bytes(vec![service_record(
+      "example",
+      TYPE::HTTPS,
+      service(
+        "target.example",
+        &["192.0.2.1".parse().unwrap()],
+        &["2001:db8::1".parse().unwrap()],
+        &[],
+      ),
+    )]);
+
+    let rewritten = mangle_svcb_response(&name("example"), bytes.clone(), &rule(true, false, false), false).unwrap();
+
+    assert_eq!(rewritten, bytes);
+  }
+
+  #[test]
+  fn rewriting_clears_ad_and_only_removes_invalidated_signatures() {
+    let owner = "example";
+    let mut packet = Packet::new_reply(0x1234);
+    packet.set_flags(PacketFlag::AUTHENTIC_DATA | PacketFlag::RECURSION_AVAILABLE);
+    packet.answers = vec![
+      service_record(
+        owner,
+        TYPE::HTTPS,
+        service("target.example", &["192.0.2.1".parse().unwrap()], &[], &[]),
+      ),
+      rrsig(owner, TYPE::HTTPS),
+      rrsig(owner, TYPE::SVCB),
+      rrsig("other.example", TYPE::HTTPS),
+    ];
+    packet.additional_records = vec![
+      rrsig(owner, TYPE::HTTPS),
+      ResourceRecord::new(
+        name("target.example"),
+        CLASS::IN,
+        300,
+        RData::A(A::from("192.0.2.1".parse::<Ipv4Addr>().unwrap())),
+      ),
+    ];
+    let bytes = packet.build_bytes_vec_compressed().unwrap();
+
+    let rewritten = mangle_svcb_response(&name(owner), bytes, &rule(true, false, false), false).unwrap();
+    let packet = Packet::parse(&rewritten).unwrap();
+
+    assert!(!packet.has_flags(PacketFlag::AUTHENTIC_DATA));
+    assert_eq!(packet.answers.len(), 3);
+    assert!(
+      packet
+        .answers
+        .iter()
+        .any(|rr| { matches!(&rr.rdata, RData::RRSIG(signature) if signature.type_covered == u16::from(TYPE::SVCB)) })
+    );
+    assert!(packet.answers.iter().any(|rr| rr.name == name("other.example")));
+    assert_eq!(packet.additional_records.len(), 1);
+    assert_eq!(packet.additional_records[0].rdata.type_code(), TYPE::A);
+  }
 }
