@@ -12,10 +12,11 @@ default_upstream = "1.1.1.1"
 
 # Each [[rule]] section matches queries for specific domains.
 # Rules are matched by longest domain suffix (trie lookup).
+# An exact /96 rDNS rule is added automatically for each DNS64 prefix.
 
 # DNS64 synthesis + strip A records
 [[rule]]
-domains = ["exampl*.com", "example.org", "ipv4only.arpa", "b.9.f.f.4.6.0.0.ip6.arpa"]
+domains = ["exampl*.com", "example.org", "ipv4only.arpa"]
 strip_a = true
 dns64_prefix = "64:ff9b::"
 
@@ -39,7 +40,7 @@ upstream = ["223.5.5.5", "223.6.6.6"]
 # To match all domains not covered by other rules, use "." as the domain.
 # [[rule]]
 # domains = "."
-# dns64_prefix = "64:ff9b:abcd::"
+# dns64_prefix = "64:ff9b:1:abcd::"
 
 # Additional instances can be imported from other files.
 # Each imported file uses the same flat structure as this file:

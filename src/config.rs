@@ -104,7 +104,7 @@ pub struct Config {
   #[serde(deserialize_with = "deserialize_socket_addrs")]
   pub default_upstream: Box<[SocketAddr]>,
   #[serde(rename = "rule", default)]
-  pub rules: Box<[Rule]>,
+  pub rules: Vec<Rule>,
   #[serde(default)]
   pub log: bool,
 }
@@ -189,7 +189,7 @@ impl ConfigBody {
     Ok(Config {
       listen: self.listen.context("missing listen")?.0,
       default_upstream: self.default_upstream.context("missing default_upstream")?.0,
-      rules: Box::new([]),
+      rules: Vec::new(),
       log: self.log,
     })
   }
@@ -263,7 +263,7 @@ fn read_config_inner(
 
   let loaded = parse_config_file(&path)?;
   if let Some(LoadedConfig { mut config, rules }) = loaded.config {
-    config.rules = expand_rule_entries(rules, &path, &mut Vec::new())?.into_boxed_slice();
+    config.rules = expand_rule_entries(rules, &path, &mut Vec::new())?;
     config.log |= cli.verbose;
     configs.push(config);
   }

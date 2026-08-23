@@ -6,6 +6,18 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAX_CNAME_DEPTH: usize = 11;
 
+pub fn rdns_domain(prefix: Ipv6Addr) -> String {
+  let mut domain = String::with_capacity(24 * 2 + "ip6.arpa".len());
+  for byte in prefix.octets()[..12].iter().rev() {
+    domain.push(char::from_digit(u32::from(byte & 0x0f), 16).expect("nibble is valid hex"));
+    domain.push('.');
+    domain.push(char::from_digit(u32::from(byte >> 4), 16).expect("nibble is valid hex"));
+    domain.push('.');
+  }
+  domain.push_str("ip6.arpa");
+  domain
+}
+
 struct ChangedRrset {
   name: Name<'static>,
   class: CLASS,
@@ -395,6 +407,14 @@ mod tests {
 
   fn name(value: &str) -> Name<'static> {
     Name::new(value).unwrap().into_owned()
+  }
+
+  #[test]
+  fn builds_exact_dns64_rdns_domain() {
+    assert_eq!(
+      rdns_domain("64:ff9b:1:3::".parse().unwrap()),
+      format!("{}3.0.0.0.1.0.0.0.b.9.f.f.4.6.0.0.ip6.arpa", "0.".repeat(8))
+    );
   }
 
   fn service(target: &str, ipv4hints: &[Ipv4Addr], ipv6hints: &[Ipv6Addr], mandatory: &[u16]) -> SVCB<'static> {
