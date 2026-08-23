@@ -248,7 +248,7 @@ fn parse_ip6_arpa_name(name: &Name<'_>) -> Option<Ipv6Addr> {
   }
 
   let mut bytes = [0u8; 16];
-  for (i, chunk) in reversed.as_bytes().chunks_exact(2).enumerate() {
+  for (i, chunk) in reversed.as_bytes().as_chunks::<2>().0.iter().enumerate() {
     let hex = std::str::from_utf8(chunk).ok()?;
     bytes[i] = u8::from_str_radix(hex, 16).ok()?;
   }
