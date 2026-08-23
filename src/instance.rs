@@ -8,7 +8,7 @@ use async_net::{TcpListener, TcpStream, UdpSocket};
 use fqdn::FQDN;
 use fqdn_trie::FqdnTrieMap;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
-use simple_dns::{Name, Packet, QTYPE, TYPE};
+use simple_dns::{Name, Packet, PacketFlag, QTYPE, Question, RCODE, TYPE};
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -107,6 +107,10 @@ impl Instance {
       (Some(rule), TYPE::PTR) if rule.dns64_prefix.is_some() => {
         dns64::handle_dns64_rdns(query, rule, addresses, transport, self.config.log).await
       }
+      (Some(rule), TYPE::HTTPS | TYPE::SVCB) if rule.dns64_prefix.is_some() => {
+        // TODO: mangle HTTPS and SVCB records
+        empty_response(query)
+      }
       _ => {
         let query_bytes = query.build_bytes_vec_compressed()?;
         let resp_bytes = transport::resolve(addresses, &query_bytes, qname, transport).await?;
@@ -133,6 +137,14 @@ impl Instance {
     }
     Ok(resp.build_bytes_vec_compressed()?)
   }
+}
+
+fn empty_response(query: Packet<'_>) -> anyhow::Result<Vec<u8>> {
+  let mut resp = Packet::new_reply(query.id());
+  resp.set_flags(PacketFlag::RECURSION_AVAILABLE);
+  *resp.rcode_mut() = RCODE::NoError;
+  resp.questions.extend(query.questions.into_iter().map(Question::into_owned));
+  Ok(resp.build_bytes_vec_compressed()?)
 }
 
 pub async fn start_instance(ex: Rc<LocalExecutor<'static>>, config: Config) -> anyhow::Result<()> {
@@ -265,6 +277,9 @@ fn question_type(qtype: QTYPE) -> TYPE {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use futures_lite::future::block_on;
+  use simple_dns::{CLASS, QCLASS};
+  use std::net::Ipv6Addr;
 
   fn make_config(rules: Vec<crate::config::Rule>) -> Config {
     Config {
@@ -291,6 +306,51 @@ mod tests {
 
   fn name(s: &str) -> Name<'_> {
     Name::new(s.trim_end_matches('.')).unwrap()
+  }
+
+  fn query(id: u16, qname: &str, qtype: TYPE) -> Packet<'static> {
+    let mut query = Packet::new_query(id);
+    query.set_flags(PacketFlag::RECURSION_DESIRED);
+    query.questions.push(Question::new(
+      name(qname).into_owned(),
+      QTYPE::TYPE(qtype),
+      QCLASS::CLASS(CLASS::IN),
+      false,
+    ));
+    query
+  }
+
+  #[test]
+  fn dns64_blocks_https_and_svcb_with_empty_noerror() {
+    const QUERY_ID: u16 = 0x1234;
+
+    let mut rule = make_rule(&["example.com"]);
+    rule.dns64_prefix = Some("64:ff9b::".parse::<Ipv6Addr>().unwrap());
+    let instance = Instance::new(make_config(vec![rule]));
+
+    for qtype in [TYPE::HTTPS, TYPE::SVCB] {
+      let qname = name("example.com");
+      let resp_bytes = block_on(instance.resolve_query(
+        query(QUERY_ID, "example.com", qtype),
+        &qname,
+        qtype,
+        instance.select_rule(&qname),
+        &[],
+        Transport::Udp,
+      ))
+      .unwrap();
+      let resp = Packet::parse(&resp_bytes).unwrap();
+
+      assert_eq!(resp.id(), QUERY_ID);
+      assert_eq!(resp.rcode(), RCODE::NoError);
+      assert!(resp.has_flags(PacketFlag::RECURSION_AVAILABLE));
+      assert_eq!(resp.questions.len(), 1);
+      assert_eq!(resp.questions[0].qname, qname);
+      assert_eq!(resp.questions[0].qtype, QTYPE::TYPE(qtype));
+      assert!(resp.answers.is_empty());
+      assert!(resp.name_servers.is_empty());
+      assert!(resp.additional_records.is_empty());
+    }
   }
 
   #[test]
